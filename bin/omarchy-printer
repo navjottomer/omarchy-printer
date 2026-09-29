@@ -66,6 +66,8 @@ MAX_JOBS = 20
 MAX_TEXT = 80
 MAX_RECORD = 32768
 MAX_ADDRS = 4
+MAX_IPPTOOL_OUTPUT = 1 << 20   # bytes read from one ipptool run
+MAX_AVAHI_OUTPUT = 256 << 10   # bytes read from one avahi-browse run
 
 # Absolute paths, so nothing earlier in PATH can stand in for these.
 IPPTOOL = "/usr/bin/ipptool"
@@ -166,6 +168,48 @@ def clip(value, n=MAX_TEXT) -> str:
     return s[:n]
 
 
+def run_capped(argv: list[str], timeout: float, limit: int) -> str | None:
+    """Run argv and return its stdout, reading at most `limit` bytes.
+
+    Returns None if it cannot start, runs past `timeout`, or prints more than
+    `limit` bytes; the command is then killed. Printers and mDNS advertisers
+    control this output, so it is never read without a bound.
+    """
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    buf = bytearray()
+    ok = False
+    deadline = time.monotonic() + timeout
+    try:
+        fd = proc.stdout.fileno()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                break
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                ok = True
+                break
+            buf += chunk
+            if len(buf) > limit:
+                break
+    except OSError:
+        pass
+    finally:
+        if not ok and proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+        try:
+            proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    return buf.decode("utf-8", "replace") if ok else None
+
+
 def run_ipptool(uri: str, test_file: str, variables: dict | None = None) -> list[list[dict]]:
     """Run one ipptool test file; return, per request, its attribute groups.
 
@@ -177,10 +221,8 @@ def run_ipptool(uri: str, test_file: str, variables: dict | None = None) -> list
     argv = [IPPTOOL, "-tv"]
     for k, v in (variables or {}).items():
         argv += ["-d", f"{k}={v}"]
-    try:
-        out = subprocess.run(argv + [uri, test_file], capture_output=True, text=True,
-                             timeout=IPPTOOL_TIMEOUT + 5, stdin=subprocess.DEVNULL).stdout
-    except (OSError, subprocess.TimeoutExpired):
+    out = run_capped(argv + [uri, test_file], IPPTOOL_TIMEOUT + 5, MAX_IPPTOOL_OUTPUT)
+    if out is None:
         return []
     requests: list[list[dict]] = []
     cur: dict = {}
@@ -216,8 +258,8 @@ def ipptool_ok(uri: str, test_file: str, variables: dict | None = None) -> bool:
     for k, v in (variables or {}).items():
         argv += ["-d", f"{k}={v}"]
     try:
-        return subprocess.run(argv + [uri, test_file], capture_output=True, timeout=IPPTOOL_TIMEOUT + 5,
-                              stdin=subprocess.DEVNULL).returncode == 0
+        return subprocess.run(argv + [uri, test_file], timeout=IPPTOOL_TIMEOUT + 5, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
@@ -319,10 +361,8 @@ def resolve_network() -> dict:
     """
     found: dict = {}
     for service, scheme in (("_ipps._tcp", "ipps"), ("_ipp._tcp", "ipp")):
-        try:
-            out = subprocess.run([AVAHI_BROWSE, "-rpt", service], capture_output=True, text=True,
-                                 timeout=8, stdin=subprocess.DEVNULL).stdout
-        except (OSError, subprocess.TimeoutExpired):
+        out = run_capped([AVAHI_BROWSE, "-rpt", service], 8, MAX_AVAHI_OUTPUT)
+        if out is None:
             continue
         for line in out.splitlines()[:500]:
             f = line.split(";")

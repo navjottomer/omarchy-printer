@@ -162,7 +162,9 @@ left behind.
 Idle, the whole thing measures about 0 ms of CPU per minute and 18 MB of
 memory.
 
-**Bounds.** At most 8 printers, 8 toners and 20 jobs per record, text fields
+**Bounds.** Output from `ipptool` (1 MB) and `avahi-browse` (256 KB) is read
+only up to a fixed size, and a command that prints more or runs too long is
+stopped. At most 8 printers, 8 toners and 20 jobs per record, text fields
 clipped to 80 characters, and each record capped at 32 KB. All
 printer-supplied text is shown as plain text, never as markup. Actions run
 with fixed arguments, never through a shell.
