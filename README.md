@@ -15,13 +15,16 @@ drivers, vendor tools or extra packages.
   printers so they are current, not only updated during a print job. Low toner
   turns red.
 - **Status and paper:** Ready, Printing, Sleeping, Paused or Offline, any
-  problem the printer reports, and the paper size that is loaded.
+  problem the printer reports, and the paper size that is loaded. A network
+  printer that is switched off shows as Offline within about 30 seconds,
+  even though CUPS itself only notices when it next tries to print.
 - **Print queue** with a cancel button on each of your jobs, and *Cancel all
   my jobs*.
 - **Actions:** pause or resume the printer, print a test page (click twice to
   confirm), open the printer's own web page, open printer settings.
 - **Notifications** when a job finishes or fails, when paper runs out or jams,
-  and once when a toner runs low.
+  once when a toner runs low, and once when a job is waiting for a printer
+  that is offline.
 - **Several printers:** a picker appears when more than one is set up.
 
 ## Requirements
@@ -120,10 +123,13 @@ colour so it stays visible on a dark bar.
 1. asks the local CUPS scheduler (`ipptool`) for printers, their state and the
    queue — every 2 seconds while anything is printing, every 15 seconds
    otherwise;
-2. finds network printers with `avahi-browse` and asks them directly for
+2. on each poll, opens and closes a connection to each network printer (2 s
+   limit, no new process); two misses in a row, or a printer no longer
+   announced on the network, mean Offline;
+3. finds network printers with `avahi-browse` and asks them directly for
    toner, loaded paper and alerts every 5 minutes, and right after a job
    finishes;
-3. prints one JSON line to the panel only when something changed, and sends
+4. prints one JSON line to the panel only when something changed, and sends
    notifications itself.
 
 The panel sends it `refresh` after an action so the result shows at once.

@@ -56,7 +56,8 @@ Panel {
   readonly property bool hasProblem: !!printer && (printer.problems || []).some(function(p) {
     return p.indexOf("toner low") < 0
   })
-  readonly property bool paused: !!printer && (printer.status === "Paused" || printer.status === "Offline")
+  readonly property bool paused: !!printer && printer.status === "Paused"
+  readonly property bool offline: !!printer && printer.status === "Offline"
 
   readonly property string pluginDir: {
     var s = String(Qt.resolvedUrl("."))
@@ -172,9 +173,9 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     // printer / printer-off (nf-md)
-    text: !root.printer || root.paused ? "\u{f0e5d}" : "\u{f042a}"
+    text: !root.printer || root.paused || root.offline ? "\u{f0e5d}" : "\u{f042a}"
     active: root.hasProblem
-    dimmed: !root.printer || root.paused
+    dimmed: !root.printer || root.paused || root.offline
     tooltipText: !root.printer ? "No printer"
       : root.printer.info + " · " + (root.hasProblem ? root.printer.problems[0] : root.printer.status)
         + (root.jobs.length ? " · " + root.jobs.length + (root.jobs.length === 1 ? " job" : " jobs") : "")

@@ -13,8 +13,12 @@ characters). A line "refresh" on stdin forces an immediate poll; the panel
 sends it after cancelling a job or pausing a printer.
 
 The scheduler is polled every POLL_ACTIVE seconds while anything is printing
-or queued, otherwise every POLL_IDLE seconds. Network printers themselves are
-asked every DEVICE_EVERY seconds, and right after a job finishes.
+or queued, otherwise every POLL_IDLE seconds. Each poll also opens (and
+closes) a TCP connection to every network printer, so one that is switched
+off shows as offline after OFFLINE_AFTER missed polls; CUPS itself only
+notices when it next tries to send a job. Network printers are asked for
+toner and paper every DEVICE_EVERY seconds, right after a job finishes, and
+as soon as an offline printer answers again.
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -34,6 +39,9 @@ POLL_ACTIVE = 2
 POLL_IDLE = 15
 DEVICE_EVERY = 300
 RESOLVE_EVERY = 1800
+RESOLVE_RETRY = 60      # while a network printer cannot be found at all
+REACH_TIMEOUT = 2       # seconds for the per-poll "is it on the network" knock
+OFFLINE_AFTER = 2       # missed knocks in a row before a printer counts as offline
 IPPTOOL_TIMEOUT = 10  # enforced by subprocess; ipptool -T can hang on TLS
 
 # Bounds, so the shell never buffers an unbounded line.
@@ -201,8 +209,8 @@ def media_label(value: str) -> str:
     return MEDIA_NAMES.get(m.group(1), m.group(2))
 
 
-def status_of(state: str, accepting: bool, reasons: list[str], alert: str) -> str:
-    if "offline" in reasons or "connecting-to-device" in reasons:
+def status_of(state: str, accepting: bool, reasons: list[str], alert: str, offline: bool = False) -> str:
+    if offline or "offline" in reasons:
         return "Offline"
     if state == "stopped" or not accepting:
         return "Paused"
@@ -250,14 +258,21 @@ def resolve_network() -> dict:
             if len(f) < 10 or f[0] != "=":
                 continue
             name = f[3].replace("\\032", " ")
-            host, port, txt = f[6], f[8], f[9]
+            proto, host, addr, port, txt = f[2], f[6], f[7], f[8], f[9]
             if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host) or not port.isdigit():
                 continue
             rp = re.search(r'"rp=([^"]*)"', txt)
             path = rp.group(1) if rp and re.fullmatch(r"[A-Za-z0-9/_.-]{0,64}", rp.group(1)) else "ipp/print"
             host = host.rstrip(".")
-            if name not in found or scheme == "ipps":
-                found[name] = {"uri": f"{scheme}://{host}:{port}/{path}", "web": f"https://{host}/"}
+            if not re.fullmatch(r"[0-9.]{7,15}|[0-9A-Fa-f:]{2,39}", addr):
+                addr = ""
+            entry = {"uri": f"{scheme}://{host}:{port}/{path}", "web": f"https://{host}/",
+                     "addr": addr, "port": int(port), "v4": proto == "IPv4"}
+            old = found.get(name)
+            # Prefer IPPS, then an IPv4 address (IPv6 link-local needs a scope).
+            if (old is None or (scheme == "ipps" and old["uri"].startswith("ipp:"))
+                    or (entry["v4"] and not old["v4"] and entry["uri"].split(":")[0] == old["uri"].split(":")[0])):
+                found[name] = entry
     return found
 
 
@@ -265,6 +280,25 @@ def device_key(device_uri: str) -> str:
     """DNS-SD service name from a dnssd device URI, else ''."""
     m = re.match(r"^ipps?://([^/]+?)\._ipps?\._tcp\.local/?", device_uri or "")
     return urllib.parse.unquote(m.group(1)) if m else ""
+
+
+def reach_target(device_uri: str, network: dict) -> tuple[str, int] | None:
+    """(address, port) to knock on for a network printer, else None."""
+    key = device_key(device_uri)
+    if key and key in network and network[key].get("addr") and network[key].get("v4"):
+        return network[key]["addr"], network[key]["port"]
+    m = re.match(r"^(ipps?)://([A-Za-z0-9.-]+)(?::(\d+))?(/\S*)?$", device_uri or "")
+    if m and not device_key(device_uri):
+        return m.group(2), int(m.group(3) or 631)
+    return None
+
+
+def knock(target: tuple[str, int]) -> bool:
+    try:
+        with socket.create_connection(target, timeout=REACH_TIMEOUT):
+            return True
+    except OSError:
+        return False
 
 
 def direct_uri(device_uri: str, network: dict) -> tuple[str, str]:
@@ -313,6 +347,8 @@ class Monitor:
         self.active_jobs: dict = {}     # job id -> (name, printer)
         self.problems: set = set()      # (printer, keyword) already notified
         self.low: set = set()           # (printer, marker) already notified
+        self.misses: dict = {}          # printer name -> missed knocks in a row
+        self.offline_told: set = set()  # printers already announced as offline
         self.first = True
         self.last = ""
         self.busy = False
@@ -324,16 +360,42 @@ class Monitor:
             return {"ok": False, "error": "CUPS is not answering", "printers": [], "jobs": []}
         printers_raw, jobs_raw, done_raw = res[0], res[1], res[2]
 
-        if now - self.resolved_at > RESOLVE_EVERY or not self.resolved_at:
-            self.network = resolve_network()
+        unresolved = any(device_key(p.get("device-uri", "")) and
+                         device_key(p.get("device-uri", "")) not in self.network
+                         for p in printers_raw[:MAX_PRINTERS])
+        wait = RESOLVE_RETRY if unresolved else RESOLVE_EVERY
+        if now - self.resolved_at > wait or not self.resolved_at:
+            # Merge, so a printer that is off right now keeps its last address.
+            self.network = {**self.network, **resolve_network()}
             self.resolved_at = now
+
+        # Is each network printer still there?
+        offline = set()
+        for p in printers_raw[:MAX_PRINTERS]:
+            name = p.get("printer-name", "")
+            target = reach_target(p.get("device-uri", ""), self.network)
+            key = device_key(p.get("device-uri", ""))
+            if not name or (target is None and not key):
+                continue  # USB or other local printer: CUPS knows best
+            # A network printer that is not even announced on the network
+            # counts as a miss, just like one that does not answer.
+            if target is not None and knock(target):
+                if self.misses.get(name, 0) >= OFFLINE_AFTER:
+                    force_device = True  # back online: read fresh toner now
+                self.misses[name] = 0
+            else:
+                self.misses[name] = self.misses.get(name, 0) + 1
+            if self.misses[name] >= OFFLINE_AFTER:
+                offline.add(name)
 
         # Fresh readings from network printers: toner, loaded paper, alerts.
         if force_device or now - self.device_at > DEVICE_EVERY:
             self.device_at = now
             for p in printers_raw[:MAX_PRINTERS]:
                 uri, _ = direct_uri(p.get("device-uri", ""), self.network)
-                if not uri:
+                # Skip printers that just missed a knock: the query would only
+                # sit out its timeout.
+                if not uri or self.misses.get(p.get("printer-name", ""), 0) > 0:
                     continue
                 r = run_ipptool(uri, self.files["device"])
                 attrs = r[0][0] if r and r[0] else None
@@ -367,7 +429,7 @@ class Monitor:
                 "info": clip(p.get("printer-info", "") or name),
                 "state": state,
                 "accepting": accepting,
-                "status": status_of(state, accepting, reasons, alert),
+                "status": status_of(state, accepting, reasons, alert, name in offline),
                 "problems": problems_of(reasons, markers),
                 "message": clip(p.get("printer-state-message", "")),
                 "reasons": reasons,
@@ -445,6 +507,14 @@ class Monitor:
             elif state == "aborted":
                 notify("Printing failed", label, urgent=True)
         for p in printers:
+            # Offline with work waiting: say so once per outage.
+            if p["status"] == "Offline" and p["queued"] > 0:
+                if p["name"] not in self.offline_told:
+                    self.offline_told.add(p["name"])
+                    n = p["queued"]
+                    notify("Printer offline", f"{p['info']}: {n} job{'s' if n != 1 else ''} waiting", urgent=True)
+            elif p["status"] != "Offline":
+                self.offline_told.discard(p["name"])
             keys = set()
             for r in p["reasons"]:
                 for key, text in PROBLEMS.items():
