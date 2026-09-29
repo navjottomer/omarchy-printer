@@ -109,7 +109,8 @@ Panel {
   }
 
   // ---------- Actions ----------
-  // Commands run with fixed argv (no shell); the feed is refreshed after each.
+  // Commands run with fixed argv and absolute paths (no shell, no PATH
+  // lookup); the feed is refreshed after each.
   Process {
     id: action
     running: false
@@ -124,19 +125,19 @@ Panel {
   }
 
   function cancelJob(id) {
-    if (/^[0-9]{1,9}$/.test(String(id))) run(["cancel", String(id)])
+    if (/^[0-9]{1,9}$/.test(String(id))) run(["/usr/bin/cancel", String(id)])
   }
 
   function cancelMine() {
     var ids = myJobs.map(function(j) { return String(j.id) }).filter(function(id) { return /^[0-9]{1,9}$/.test(id) })
-    if (ids.length) run(["cancel"].concat(ids))
+    if (ids.length) run(["/usr/bin/cancel"].concat(ids))
   }
 
   // Pausing needs admin rights in CUPS; pkexec shows the shell's password prompt.
   function togglePause() {
     if (!safeName) return
     close()
-    run(["pkexec", paused ? "/usr/bin/cupsenable" : "/usr/bin/cupsdisable", safeName])
+    run(["/usr/bin/pkexec", paused ? "/usr/bin/cupsenable" : "/usr/bin/cupsdisable", safeName])
   }
 
   property bool testArmed: false
@@ -145,18 +146,18 @@ Panel {
     if (!safeName) return
     if (!testArmed) { testArmed = true; disarm.restart(); return }
     testArmed = false
-    run(["lp", "-d", safeName, "-t", "Test page", "/usr/share/cups/data/testprint"])
+    run(["/usr/bin/lp", "-d", safeName, "-t", "Test page", "/usr/share/cups/data/testprint"])
   }
 
   function openWeb() {
     if (printer && /^https?:\/\/[A-Za-z0-9.-]+\/$/.test(printer.web)) {
-      Quickshell.execDetached(["xdg-open", printer.web])
+      Quickshell.execDetached(["/usr/bin/xdg-open", printer.web])
       close()
     }
   }
 
   function openSettings() {
-    Quickshell.execDetached(["uwsm-app", "--", "system-config-printer"])
+    Quickshell.execDetached(["/usr/bin/uwsm-app", "--", "/usr/bin/system-config-printer"])
     close()
   }
 

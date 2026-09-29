@@ -43,9 +43,11 @@ MAX_JOBS = 20
 MAX_TEXT = 80
 MAX_RECORD = 32768
 
-IPPTOOL = shutil.which("ipptool") or "/usr/bin/ipptool"
-AVAHI_BROWSE = shutil.which("avahi-browse") or "/usr/bin/avahi-browse"
-NOTIFY_SEND = shutil.which("notify-send") or "/usr/bin/notify-send"
+# Absolute paths, so nothing earlier in PATH can stand in for these.
+IPPTOOL = "/usr/bin/ipptool"
+AVAHI_BROWSE = "/usr/bin/avahi-browse"
+NOTIFY_SEND = "/usr/bin/notify-send"
+LPSTAT = "/usr/bin/lpstat"
 
 MARKER_LABELS = {"BK": "Black", "K": "Black", "C": "Cyan", "M": "Magenta", "Y": "Yellow"}
 # printer-state-reasons worth a notification, by keyword prefix.
@@ -413,7 +415,7 @@ class Monitor:
 
         default = ""
         try:
-            out = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=5,
+            out = subprocess.run([LPSTAT, "-d"], capture_output=True, text=True, timeout=5,
                                  stdin=subprocess.DEVNULL).stdout
             m = re.search(r"destination: (\S+)", out)
             default = m.group(1) if m else ""
