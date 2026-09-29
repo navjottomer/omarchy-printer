@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "navjottomer.printer",
+  "name": "Printer",
+  "version": "1.0.0",
+  "author": "navjottomer",
+  "license": "MIT",
+  "description": "Printer status, toner levels and the print queue in the Omarchy bar, using only CUPS and Avahi",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Printer",
+    "description": "Printer status, toner and print queue",
+    "category": "Hardware",
+    "aliases": [
+      "printer",
+      "print",
+      "cups",
+      "toner"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "tonerColors": "real",
+      "notifications": true
+    },
+    "schema": [
+      {
+        "key": "tonerColors",
+        "type": "enum",
+        "label": "Toner bar colours",
+        "options": [
+          "real",
+          "theme"
+        ],
+        "defaultValue": "real"
+      },
+      {
+        "key": "notifications",
+        "type": "boolean",
+        "label": "Notify on finished jobs, paper problems and low toner",
+        "defaultValue": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,502 @@
+#!/usr/bin/python3
+"""Stream printer status for the Omarchy bar as JSON lines.
+
+Everything comes from software every Omarchy install already has: CUPS
+(`ipptool`, talking to the local scheduler and, for fresh toner and paper
+readings, to network printers directly), Avahi (`avahi-browse`, to find a
+network printer's address and web page) and `notify-send`.
+
+Usage: omarchy-printer [--no-notify]
+
+One JSON object is printed per change (never more than MAX_RECORD
+characters). A line "refresh" on stdin forces an immediate poll; the panel
+sends it after cancelling a job or pausing a printer.
+
+The scheduler is polled every POLL_ACTIVE seconds while anything is printing
+or queued, otherwise every POLL_IDLE seconds. Network printers themselves are
+asked every DEVICE_EVERY seconds, and right after a job finishes.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+POLL_ACTIVE = 2
+POLL_IDLE = 15
+DEVICE_EVERY = 300
+RESOLVE_EVERY = 1800
+IPPTOOL_TIMEOUT = 10  # enforced by subprocess; ipptool -T can hang on TLS
+
+# Bounds, so the shell never buffers an unbounded line.
+MAX_PRINTERS = 8
+MAX_MARKERS = 8
+MAX_JOBS = 20
+MAX_TEXT = 80
+MAX_RECORD = 32768
+
+IPPTOOL = shutil.which("ipptool") or "/usr/bin/ipptool"
+AVAHI_BROWSE = shutil.which("avahi-browse") or "/usr/bin/avahi-browse"
+NOTIFY_SEND = shutil.which("notify-send") or "/usr/bin/notify-send"
+
+MARKER_LABELS = {"BK": "Black", "K": "Black", "C": "Cyan", "M": "Magenta", "Y": "Yellow"}
+# printer-state-reasons worth a notification, by keyword prefix.
+PROBLEMS = {
+    "media-jam": "Paper jam",
+    "media-empty": "Out of paper",
+    "media-needed": "Load paper",
+    "door-open": "A door is open",
+    "cover-open": "The cover is open",
+    "input-tray-missing": "Paper tray missing",
+    "toner-empty": "Toner empty",
+    "marker-supply-empty": "Toner empty",
+    "output-area-full": "Output tray full",
+}
+# ipptool prints job-state as its keyword; numbers are accepted too.
+JOB_STATES = {"3": "pending", "4": "held", "5": "printing", "6": "stopped",
+              "7": "canceled", "8": "aborted", "9": "completed",
+              "pending": "pending", "pending-held": "held", "processing": "printing",
+              "processing-stopped": "stopped", "canceled": "canceled",
+              "aborted": "aborted", "completed": "completed"}
+
+
+def job_state(value) -> str:
+    return JOB_STATES.get(str(value or "").strip(), "")
+
+HEADER = ('GROUP operation-attributes-tag ATTR charset attributes-charset utf-8 '
+          'ATTR naturalLanguage attributes-natural-language en ')
+TESTS = {
+    "cups": (
+        '{ NAME "printers" OPERATION CUPS-Get-Printers ' + HEADER +
+        'ATTR keyword requested-attributes printer-name,printer-info,printer-state,'
+        'printer-state-reasons,printer-state-message,printer-is-accepting-jobs,'
+        'queued-job-count,device-uri,marker-names,marker-levels,marker-low-levels,'
+        'marker-colors,printer-type '
+        'STATUS successful-ok STATUS client-error-not-found }\n'
+        '{ NAME "jobs" OPERATION Get-Jobs ' + HEADER +
+        'ATTR uri printer-uri ipp://localhost/ ATTR name requesting-user-name $user '
+        'ATTR keyword which-jobs not-completed '
+        'ATTR keyword requested-attributes job-id,job-name,job-state,job-printer-uri,'
+        'job-originating-user-name,job-impressions-completed,time-at-creation '
+        'STATUS successful-ok STATUS client-error-not-found }\n'
+        '{ NAME "done" OPERATION Get-Jobs ' + HEADER +
+        'ATTR uri printer-uri ipp://localhost/ ATTR name requesting-user-name $user '
+        'ATTR keyword which-jobs completed ATTR integer limit 10 '
+        'ATTR keyword requested-attributes job-id,job-name,job-state,job-printer-uri '
+        'STATUS successful-ok STATUS client-error-not-found }\n'
+    ),
+    "device": (
+        '{ NAME "device" OPERATION Get-Printer-Attributes ' + HEADER +
+        'ATTR uri printer-uri $uri ATTR keyword requested-attributes marker-names,'
+        'marker-levels,marker-low-levels,marker-colors,media-ready,'
+        'printer-alert-description,printer-state-reasons '
+        'STATUS successful-ok STATUS successful-ok-ignored-or-substituted-attributes }\n'
+    ),
+}
+
+LINE_RE = re.compile(r"^\s+([a-z0-9-]+) \(([^)]+)\) = (.*)$")
+
+
+def clip(value, n=MAX_TEXT) -> str:
+    s = "".join(ch for ch in str(value) if ch.isprintable())
+    return s[:n]
+
+
+REQUEST_RE = re.compile(r"^    \S.*\[(PASS|FAIL|SKIP)\]\s*$")
+OPERATION_RE = re.compile(r"^    [A-Za-z-]+:\s*$")
+SKIP_ATTRS = {"attributes-charset", "attributes-natural-language"}
+
+
+def run_ipptool(uri: str, test_file: str) -> list[list[dict]]:
+    """Run one ipptool test file; return, per request, its attribute groups.
+
+    `ipptool -tv` prints, per request, an "Operation-Name:" line, the
+    request's own attributes, a "NAME ... [PASS]" line, then the response
+    attributes as "name (type) = value" with "-- separator --" between groups
+    (one group per printer or job). Only response attributes are collected.
+    """
+    try:
+        out = subprocess.run([IPPTOOL, "-tv", uri, test_file],
+                             capture_output=True, text=True, timeout=IPPTOOL_TIMEOUT + 5,
+                             stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    requests: list[list[dict]] = []
+    cur: dict = {}
+    collecting = False
+
+    def close_group() -> None:
+        nonlocal cur
+        if cur and requests:
+            requests[-1].append(cur)
+        cur = {}
+
+    for line in out.splitlines()[:20000]:
+        if OPERATION_RE.match(line):
+            close_group()
+            collecting = False
+        elif REQUEST_RE.match(line):
+            close_group()
+            requests.append([])
+            collecting = True
+        elif line.strip() == "-- separator --":
+            close_group()
+        elif collecting:
+            m = LINE_RE.match(line)
+            if m and m.group(1) not in SKIP_ATTRS:
+                cur[m.group(1)] = m.group(3)[:4096]
+    close_group()
+    return requests
+
+
+def split_list(value: str) -> list[str]:
+    return [v for v in (value or "").split(",")] if value else []
+
+
+def to_int(value, default=-1) -> int:
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return default
+
+
+def markers_from(attrs: dict) -> list[dict]:
+    names = split_list(attrs.get("marker-names", ""))
+    levels = split_list(attrs.get("marker-levels", ""))
+    lows = split_list(attrs.get("marker-low-levels", ""))
+    colors = split_list(attrs.get("marker-colors", ""))
+    out = []
+    for i, name in enumerate(names[:MAX_MARKERS]):
+        color = colors[i] if i < len(colors) else ""
+        out.append({
+            "name": clip(MARKER_LABELS.get(name, name), 24),
+            "level": to_int(levels[i]) if i < len(levels) else -1,
+            "low": to_int(lows[i], 10) if i < len(lows) else 10,
+            "color": color if re.fullmatch(r"#[0-9A-Fa-f]{6}", color or "") else "",
+        })
+    return out
+
+
+MEDIA_NAMES = {"iso_a4": "A4", "iso_a5": "A5", "iso_a3": "A3", "na_letter": "Letter",
+               "na_legal": "Legal", "na_number-10": "Envelope #10", "iso_dl": "Envelope DL",
+               "na_index-4x6": "4×6 in", "jis_b5": "B5", "iso_b5": "B5", "na_executive": "Executive"}
+
+
+def media_label(value: str) -> str:
+    """"iso_a4_210x297mm" -> "A4"; unknown sizes keep their dimensions."""
+    v = (value or "").split(",")[0].strip()
+    m = re.match(r"^([a-z]+_[a-z0-9-]+?)_(\d+(?:\.\d+)?x\d+(?:\.\d+)?(?:mm|in))$", v)
+    if not m:
+        return clip(v, 40)
+    return MEDIA_NAMES.get(m.group(1), m.group(2))
+
+
+def status_of(state: str, accepting: bool, reasons: list[str], alert: str) -> str:
+    if "offline" in reasons or "connecting-to-device" in reasons:
+        return "Offline"
+    if state == "stopped" or not accepting:
+        return "Paused"
+    if state == "processing":
+        return "Printing"
+    if alert.lower() == "sleep":
+        return "Sleeping"
+    return "Ready"
+
+
+def problems_of(reasons: list[str], markers: list[dict]) -> list[str]:
+    out = []
+    for r in reasons:
+        for key, text in PROBLEMS.items():
+            if r.startswith(key) and text not in out:
+                out.append(text)
+    for mk in markers:
+        if 0 <= mk["level"] <= mk["low"]:
+            out.append(f"{mk['name']} toner low")
+    return out[:6]
+
+
+def reasons_from(value: str) -> list[str]:
+    out = []
+    for r in split_list(value):
+        r = re.sub(r"-(error|warning|report)$", "", r.strip())
+        if r and r != "none" and r not in out:
+            out.append(clip(r, 48))
+    return out[:12]
+
+
+# ---------------------------------------------------------------- network
+
+def resolve_network() -> dict:
+    """{printer-display-name: {"uri": ipps://host:port/rp, "web": https://host/}}."""
+    found: dict = {}
+    for service, scheme in (("_ipps._tcp", "ipps"), ("_ipp._tcp", "ipp")):
+        try:
+            out = subprocess.run([AVAHI_BROWSE, "-rpt", service], capture_output=True, text=True,
+                                 timeout=8, stdin=subprocess.DEVNULL).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for line in out.splitlines()[:500]:
+            f = line.split(";")
+            if len(f) < 10 or f[0] != "=":
+                continue
+            name = f[3].replace("\\032", " ")
+            host, port, txt = f[6], f[8], f[9]
+            if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host) or not port.isdigit():
+                continue
+            rp = re.search(r'"rp=([^"]*)"', txt)
+            path = rp.group(1) if rp and re.fullmatch(r"[A-Za-z0-9/_.-]{0,64}", rp.group(1)) else "ipp/print"
+            host = host.rstrip(".")
+            if name not in found or scheme == "ipps":
+                found[name] = {"uri": f"{scheme}://{host}:{port}/{path}", "web": f"https://{host}/"}
+    return found
+
+
+def device_key(device_uri: str) -> str:
+    """DNS-SD service name from a dnssd device URI, else ''."""
+    m = re.match(r"^ipps?://([^/]+?)\._ipps?\._tcp\.local/?", device_uri or "")
+    return urllib.parse.unquote(m.group(1)) if m else ""
+
+
+def direct_uri(device_uri: str, network: dict) -> tuple[str, str]:
+    """(uri to query the printer itself, its web page) or ('', '')."""
+    key = device_key(device_uri)
+    if key and key in network:
+        return network[key]["uri"], network[key]["web"]
+    m = re.match(r"^(ipps?)://([A-Za-z0-9.-]+)(:\d+)?(/\S*)?$", device_uri or "")
+    if m:
+        host = m.group(2)
+        return device_uri, f"https://{host}/"
+    return "", ""
+
+
+# ---------------------------------------------------------------- notify
+
+NOTIFY = "--no-notify" not in sys.argv[1:]
+
+
+def notify(title: str, body: str = "", urgent: bool = False) -> None:
+    if not NOTIFY:
+        return
+    try:
+        subprocess.Popen([NOTIFY_SEND, "-a", "Printer", "-i", "printer",
+                          "-u", "critical" if urgent else "normal", title, body],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- main loop
+
+class Monitor:
+    def __init__(self, tmpdir: str):
+        self.files = {}
+        for name, body in TESTS.items():
+            path = os.path.join(tmpdir, name + ".test")
+            with open(path, "w") as fh:
+                fh.write(body)
+            self.files[name] = path
+        self.network: dict = {}
+        self.resolved_at = 0.0
+        self.device: dict = {}          # printer name -> fresh readings
+        self.device_at = 0.0
+        self.active_jobs: dict = {}     # job id -> (name, printer)
+        self.problems: set = set()      # (printer, keyword) already notified
+        self.low: set = set()           # (printer, marker) already notified
+        self.first = True
+        self.last = ""
+        self.busy = False
+
+    def poll(self, force_device: bool = False) -> dict:
+        now = time.monotonic()
+        res = run_ipptool("ipp://localhost/", self.files["cups"])
+        if len(res) < 3:
+            return {"ok": False, "error": "CUPS is not answering", "printers": [], "jobs": []}
+        printers_raw, jobs_raw, done_raw = res[0], res[1], res[2]
+
+        if now - self.resolved_at > RESOLVE_EVERY or not self.resolved_at:
+            self.network = resolve_network()
+            self.resolved_at = now
+
+        # Fresh readings from network printers: toner, loaded paper, alerts.
+        if force_device or now - self.device_at > DEVICE_EVERY:
+            self.device_at = now
+            for p in printers_raw[:MAX_PRINTERS]:
+                uri, _ = direct_uri(p.get("device-uri", ""), self.network)
+                if not uri:
+                    continue
+                r = run_ipptool(uri, self.files["device"])
+                attrs = r[0][0] if r and r[0] else None
+                # A sleeping printer can miss a query: keep the last good
+                # readings and try again sooner.
+                if attrs and attrs.get("marker-names"):
+                    attrs["_at"] = int(time.time())
+                    self.device[p.get("printer-name", "")] = attrs
+                else:
+                    self.device_at = now - DEVICE_EVERY + 60
+
+        printers = []
+        printers_raw = [p for p in printers_raw if p.get("printer-name")]
+        for p in printers_raw[:MAX_PRINTERS]:
+            name = p.get("printer-name", "")
+            if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,127}", name):
+                continue
+            uri, web = direct_uri(p.get("device-uri", ""), self.network)
+            dev = self.device.get(name)
+            reasons = reasons_from(p.get("printer-state-reasons", ""))
+            if dev:
+                for r in reasons_from(dev.get("printer-state-reasons", "")):
+                    if r not in reasons:
+                        reasons.append(r)
+            markers = markers_from(dev if dev and dev.get("marker-names") else p)
+            state = clip(p.get("printer-state", "unknown"), 16)
+            accepting = p.get("printer-is-accepting-jobs", "true") == "true"
+            alert = clip((dev or {}).get("printer-alert-description", "").split(",")[0], 40)
+            printers.append({
+                "name": name,
+                "info": clip(p.get("printer-info", "") or name),
+                "state": state,
+                "accepting": accepting,
+                "status": status_of(state, accepting, reasons, alert),
+                "problems": problems_of(reasons, markers),
+                "message": clip(p.get("printer-state-message", "")),
+                "reasons": reasons,
+                "queued": max(0, to_int(p.get("queued-job-count", 0), 0)),
+                "markers": markers,
+                "media": media_label((dev or {}).get("media-ready", "")),
+                "alert": alert,
+                "readingsAt": int((dev or {}).get("_at", 0)),
+                "web": web if re.fullmatch(r"https?://[A-Za-z0-9.-]+/", web or "") else "",
+            })
+
+        user = os.environ.get("USER", "")
+        jobs = []
+        current: dict = {}
+        for j in jobs_raw:
+            jid = to_int(j.get("job-id"), 0)
+            if jid <= 0:
+                continue
+            state = job_state(j.get("job-state")) or "pending"
+            printer = j.get("job-printer-uri", "").rsplit("/", 1)[-1]
+            jname = j.get("job-name", "")
+            current[jid] = (jname, printer)
+            if len(jobs) < MAX_JOBS:
+                jobs.append({
+                    "id": jid,
+                    "printer": clip(printer, 127),
+                    "name": clip(jname or "Untitled"),
+                    "state": state,
+                    "pages": max(0, to_int(j.get("job-impressions-completed", 0), 0)),
+                    "mine": j.get("job-originating-user-name", "") == user,
+                    "created": max(0, to_int(j.get("time-at-creation", 0), 0)),
+                })
+
+        finished = {to_int(j.get("job-id"), 0): j for j in done_raw if to_int(j.get("job-id"), 0) > 0}
+        if not self.first:
+            self.notify_changes(printers, current, finished)
+        else:
+            self.seed(printers)
+        # A job just left the queue: read fresh toner soon.
+        if any(jid not in current for jid in self.active_jobs):
+            self.device_at = 0.0
+        self.active_jobs = current
+        self.first = False
+        self.busy = bool(current) or any(p["state"] == "processing" for p in printers)
+
+        default = ""
+        try:
+            out = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=5,
+                                 stdin=subprocess.DEVNULL).stdout
+            m = re.search(r"destination: (\S+)", out)
+            default = m.group(1) if m else ""
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return {"ok": True, "default": clip(default, 127), "printers": printers, "jobs": jobs}
+
+    def seed(self, printers: list) -> None:
+        """Remember conditions present at start, so they are not announced."""
+        for p in printers:
+            for r in p["reasons"]:
+                for key in PROBLEMS:
+                    if r.startswith(key):
+                        self.problems.add((p["name"], key))
+            for m in p["markers"]:
+                if 0 <= m["level"] <= m["low"]:
+                    self.low.add((p["name"], m["name"]))
+
+    def notify_changes(self, printers: list, current: dict, finished: dict) -> None:
+        for jid, (jname, printer) in self.active_jobs.items():
+            if jid in current:
+                continue
+            state = job_state((finished.get(jid) or {}).get("job-state"))
+            label = clip(jname or "Document")
+            if state == "completed":
+                notify("Printed", label)
+            elif state == "aborted":
+                notify("Printing failed", label, urgent=True)
+        for p in printers:
+            keys = set()
+            for r in p["reasons"]:
+                for key, text in PROBLEMS.items():
+                    if r.startswith(key):
+                        keys.add(key)
+                        if (p["name"], key) not in self.problems:
+                            notify(text, p["info"], urgent=True)
+            self.problems = {k for k in self.problems if k[0] != p["name"]} | {(p["name"], k) for k in keys}
+            lows = set()
+            for m in p["markers"]:
+                if 0 <= m["level"] <= m["low"]:
+                    lows.add(m["name"])
+                    if (p["name"], m["name"]) not in self.low:
+                        notify(f"{m['name']} toner low", f"{p['info']}: {m['level']}% left")
+            self.low = {k for k in self.low if k[0] != p["name"]} | {(p["name"], n) for n in lows}
+
+    def emit(self, payload: dict) -> None:
+        line = json.dumps(payload, separators=(",", ":"))
+        if len(line) > MAX_RECORD:
+            payload = dict(payload, jobs=[], printers=[dict(p, markers=[], reasons=p["reasons"][:2])
+                                                        for p in payload.get("printers", [])])
+            line = json.dumps(payload, separators=(",", ":"))[:MAX_RECORD]
+            if len(line) >= MAX_RECORD:
+                line = json.dumps({"ok": False, "error": "status too large", "printers": [], "jobs": []})
+        if line != self.last:
+            self.last = line
+            print(line, flush=True)
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    tmpdir = tempfile.mkdtemp(prefix="omarchy-printer-")
+    try:
+        mon = Monitor(tmpdir)
+        force = False
+        while True:
+            mon.emit(mon.poll(force_device=force))
+            force = False
+            wait = POLL_ACTIVE if mon.busy else POLL_IDLE
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], wait)
+            except (OSError, ValueError):
+                ready = []
+                time.sleep(wait)
+            if ready:
+                line = sys.stdin.readline(64)
+                if not line:  # stdin closed: keep polling on the timer
+                    sys.stdin = open(os.devnull)
+                elif line.strip() == "refresh":
+                    force = True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
