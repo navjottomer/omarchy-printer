@@ -26,14 +26,40 @@ drivers, vendor tools or extra packages.
 
 ## Requirements
 
-- [Omarchy](https://omarchy.org) with the Quickshell-based Omarchy shell
-- A printer set up in CUPS (Omarchy's printer setup, or `system-config-printer`)
-- `cups`, `avahi`, `python`, `libnotify` — all part of a standard Omarchy
-  install
-- Optional: `system-config-printer` for the **Settings** button
+Every package below is in the official Arch repositories, and all but
+`system-config-printer` come with a standard Omarchy install. The plugin
+downloads nothing and needs no printer drivers or vendor tools.
 
-Toner and paper readings need a printer that speaks IPP (any AirPrint, IPP
-Everywhere or Mopria printer). Others still show status and the queue.
+| Package | Used for |
+|---|---|
+| `cups` | the print system: `ipptool` for status, toner and the queue; `lpstat`, `lp`, `cancel`, `cupsenable`, `cupsdisable` |
+| `cups-filters` | printing the test page and driverless (IPP Everywhere / AirPrint) printing |
+| `avahi` | `avahi-browse`, to find network printers and their web page |
+| `nss-mdns` | resolving `.local` printer names |
+| `python` | the status script (standard library only, no pip packages) |
+| `libnotify` | `notify-send`, for notifications |
+| `polkit` | `pkexec`, for the password prompt when pausing or resuming |
+| `xdg-utils` | `xdg-open`, for the printer's web page |
+| `uwsm` | launching printer settings (part of Omarchy) |
+| `system-config-printer` | *optional*, the **Settings** button |
+
+Install anything missing with:
+
+```sh
+omarchy pkg add cups cups-filters avahi nss-mdns python libnotify polkit xdg-utils system-config-printer
+```
+
+The CUPS and Avahi services must be running, and `mdns_minimal` must be in the
+`hosts:` line of `/etc/nsswitch.conf` (Omarchy sets both up):
+
+```sh
+sudo systemctl enable --now cups.socket avahi-daemon.service
+```
+
+You also need a printer already added to CUPS (Omarchy's printer setup, or
+`system-config-printer`). Toner and paper readings need a printer that speaks
+IPP (any AirPrint, IPP Everywhere or Mopria printer); others still show status
+and the queue.
 
 ## Install
 
