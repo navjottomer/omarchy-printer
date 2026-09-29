@@ -4,24 +4,34 @@
 Everything comes from software every Omarchy install already has: CUPS
 (`ipptool`, talking to the local scheduler and, for fresh toner and paper
 readings, to network printers directly), Avahi (`avahi-browse`, to find a
-network printer's address and web page) and `notify-send`.
+network printer's addresses and web page), `dbus-monitor` and `notify-send`.
 
 Usage: omarchy-printer [--no-notify]
 
 One JSON object is printed per change (never more than MAX_RECORD
-characters). A line "refresh" on stdin forces an immediate poll; the panel
-sends it after cancelling a job or pausing a printer.
+characters). A line "refresh" on stdin forces an immediate update; the panel
+sends it after cancelling a job or pausing a printer. The script exits when
+stdin closes, so it never outlives the panel.
 
-The scheduler is polled every POLL_ACTIVE seconds while anything is printing
-or queued, otherwise every POLL_IDLE seconds. Each poll also opens (and
-closes) a TCP connection to every network printer, so one that is switched
-off shows as offline after OFFLINE_AFTER missed polls; CUPS itself only
-notices when it next tries to send a job. Network printers are asked for
-toner and paper every DEVICE_EVERY seconds, right after a job finishes, and
-as soon as an offline printer answers again.
+Two threads:
+
+- The main thread asks the local scheduler for printers, jobs and the default
+  printer (one `ipptool` run). CUPS announces job and printer changes over
+  D-Bus to a short-lease subscription this script holds, so while nothing is
+  printing it only polls every POLL_IDLE seconds as a safety net (every
+  POLL_IDLE_NO_EVENTS seconds if D-Bus events are unavailable), and every
+  POLL_ACTIVE seconds while a job is printing.
+- A network thread does everything that can be slow: finding printers with
+  Avahi, a TCP "knock" on every network printer every KNOCK_EVERY seconds
+  (OFFLINE_AFTER misses in a row mean offline; CUPS itself only notices when
+  it next sends a job), and asking printers directly for toner and paper
+  every DEVICE_EVERY seconds, after a job finishes, and when a printer comes
+  back. It never delays the main thread.
 """
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import json
 import os
 import re
@@ -32,17 +42,22 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 
 POLL_ACTIVE = 2
-POLL_IDLE = 15
+POLL_IDLE = 60
+POLL_IDLE_NO_EVENTS = 15
+KNOCK_EVERY = 15
 DEVICE_EVERY = 300
 RESOLVE_EVERY = 1800
 RESOLVE_RETRY = 60      # while a network printer cannot be found at all
-REACH_TIMEOUT = 2       # seconds for the per-poll "is it on the network" knock
+REACH_TIMEOUT = 2       # seconds for each knock
 OFFLINE_AFTER = 2       # missed knocks in a row before a printer counts as offline
-IPPTOOL_TIMEOUT = 10  # enforced by subprocess; ipptool -T can hang on TLS
+IPPTOOL_TIMEOUT = 10    # enforced by subprocess; ipptool -T can hang on TLS
+SUB_LEASE = 600         # D-Bus subscription lease (s); renewed at half-life
+EVENT_DEBOUNCE = 0.3
 
 # Bounds, so the shell never buffers an unbounded line.
 MAX_PRINTERS = 8
@@ -50,12 +65,13 @@ MAX_MARKERS = 8
 MAX_JOBS = 20
 MAX_TEXT = 80
 MAX_RECORD = 32768
+MAX_ADDRS = 4
 
 # Absolute paths, so nothing earlier in PATH can stand in for these.
 IPPTOOL = "/usr/bin/ipptool"
 AVAHI_BROWSE = "/usr/bin/avahi-browse"
 NOTIFY_SEND = "/usr/bin/notify-send"
-LPSTAT = "/usr/bin/lpstat"
+DBUS_MONITOR = "/usr/bin/dbus-monitor"
 
 MARKER_LABELS = {"BK": "Black", "K": "Black", "C": "Cyan", "M": "Magenta", "Y": "Yellow"}
 # printer-state-reasons worth a notification, by keyword prefix.
@@ -81,6 +97,7 @@ JOB_STATES = {"3": "pending", "4": "held", "5": "printing", "6": "stopped",
 def job_state(value) -> str:
     return JOB_STATES.get(str(value or "").strip(), "")
 
+
 HEADER = ('GROUP operation-attributes-tag ATTR charset attributes-charset utf-8 '
           'ATTR naturalLanguage attributes-natural-language en ')
 TESTS = {
@@ -89,7 +106,7 @@ TESTS = {
         'ATTR keyword requested-attributes printer-name,printer-info,printer-state,'
         'printer-state-reasons,printer-state-message,printer-is-accepting-jobs,'
         'queued-job-count,device-uri,marker-names,marker-levels,marker-low-levels,'
-        'marker-colors,printer-type '
+        'marker-colors '
         'STATUS successful-ok STATUS client-error-not-found }\n'
         '{ NAME "jobs" OPERATION Get-Jobs ' + HEADER +
         'ATTR uri printer-uri ipp://localhost/ ATTR name requesting-user-name $user '
@@ -102,6 +119,9 @@ TESTS = {
         'ATTR keyword which-jobs completed ATTR integer limit 10 '
         'ATTR keyword requested-attributes job-id,job-name,job-state,job-printer-uri '
         'STATUS successful-ok STATUS client-error-not-found }\n'
+        '{ NAME "default" OPERATION CUPS-Get-Default ' + HEADER +
+        'ATTR keyword requested-attributes printer-name '
+        'STATUS successful-ok STATUS client-error-not-found }\n'
     ),
     "device": (
         '{ NAME "device" OPERATION Get-Printer-Attributes ' + HEADER +
@@ -110,9 +130,35 @@ TESTS = {
         'printer-alert-description,printer-state-reasons '
         'STATUS successful-ok STATUS successful-ok-ignored-or-substituted-attributes }\n'
     ),
+    "subscribe": (
+        '{ NAME "subscribe" OPERATION Create-Printer-Subscriptions ' + HEADER +
+        'ATTR uri printer-uri ipp://localhost/ ATTR name requesting-user-name $user '
+        'GROUP subscription-attributes-tag ATTR uri notify-recipient-uri dbus:// '
+        'ATTR keyword notify-events job-created,job-completed,job-state-changed,'
+        'printer-state-changed,printer-added,printer-deleted,printer-modified '
+        f'ATTR integer notify-lease-duration {SUB_LEASE} '
+        'STATUS successful-ok }\n'
+    ),
+    "renew": (
+        '{ NAME "renew" OPERATION Renew-Subscription ' + HEADER +
+        'ATTR uri printer-uri ipp://localhost/ ATTR integer notify-subscription-id $subid '
+        'ATTR name requesting-user-name $user '
+        'GROUP subscription-attributes-tag '
+        f'ATTR integer notify-lease-duration {SUB_LEASE} '
+        'STATUS successful-ok }\n'
+    ),
+    "unsubscribe": (
+        '{ NAME "unsubscribe" OPERATION Cancel-Subscription ' + HEADER +
+        'ATTR uri printer-uri ipp://localhost/ ATTR integer notify-subscription-id $subid '
+        'ATTR name requesting-user-name $user '
+        'STATUS successful-ok }\n'
+    ),
 }
 
 LINE_RE = re.compile(r"^\s+([a-z0-9-]+) \(([^)]+)\) = (.*)$")
+REQUEST_RE = re.compile(r"^    \S.*\[(PASS|FAIL|SKIP)\]\s*$")
+OPERATION_RE = re.compile(r"^    [A-Za-z-]+:\s*$")
+SKIP_ATTRS = {"attributes-charset", "attributes-natural-language"}
 
 
 def clip(value, n=MAX_TEXT) -> str:
@@ -120,12 +166,7 @@ def clip(value, n=MAX_TEXT) -> str:
     return s[:n]
 
 
-REQUEST_RE = re.compile(r"^    \S.*\[(PASS|FAIL|SKIP)\]\s*$")
-OPERATION_RE = re.compile(r"^    [A-Za-z-]+:\s*$")
-SKIP_ATTRS = {"attributes-charset", "attributes-natural-language"}
-
-
-def run_ipptool(uri: str, test_file: str) -> list[list[dict]]:
+def run_ipptool(uri: str, test_file: str, variables: dict | None = None) -> list[list[dict]]:
     """Run one ipptool test file; return, per request, its attribute groups.
 
     `ipptool -tv` prints, per request, an "Operation-Name:" line, the
@@ -133,10 +174,12 @@ def run_ipptool(uri: str, test_file: str) -> list[list[dict]]:
     attributes as "name (type) = value" with "-- separator --" between groups
     (one group per printer or job). Only response attributes are collected.
     """
+    argv = [IPPTOOL, "-tv"]
+    for k, v in (variables or {}).items():
+        argv += ["-d", f"{k}={v}"]
     try:
-        out = subprocess.run([IPPTOOL, "-tv", uri, test_file],
-                             capture_output=True, text=True, timeout=IPPTOOL_TIMEOUT + 5,
-                             stdin=subprocess.DEVNULL).stdout
+        out = subprocess.run(argv + [uri, test_file], capture_output=True, text=True,
+                             timeout=IPPTOOL_TIMEOUT + 5, stdin=subprocess.DEVNULL).stdout
     except (OSError, subprocess.TimeoutExpired):
         return []
     requests: list[list[dict]] = []
@@ -167,8 +210,20 @@ def run_ipptool(uri: str, test_file: str) -> list[list[dict]]:
     return requests
 
 
+def ipptool_ok(uri: str, test_file: str, variables: dict | None = None) -> bool:
+    """True if every request in the test file passed."""
+    argv = [IPPTOOL, "-t"]
+    for k, v in (variables or {}).items():
+        argv += ["-d", f"{k}={v}"]
+    try:
+        return subprocess.run(argv + [uri, test_file], capture_output=True, timeout=IPPTOOL_TIMEOUT + 5,
+                              stdin=subprocess.DEVNULL).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def split_list(value: str) -> list[str]:
-    return [v for v in (value or "").split(",")] if value else []
+    return value.split(",") if value else []
 
 
 def to_int(value, default=-1) -> int:
@@ -244,8 +299,24 @@ def reasons_from(value: str) -> list[str]:
 
 # ---------------------------------------------------------------- network
 
+IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+IPV6_RE = re.compile(r"^[0-9A-Fa-f:]{2,39}$")
+IFACE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,15}$")
+
+
+def avahi_unescape(name: str) -> str:
+    """avahi-browse -p escapes a service name's bytes as \\DDD (decimal)."""
+    raw = re.sub(rb"\\(\d{3})", lambda m: bytes([int(m.group(1)) & 0xFF]),
+                 name.encode("utf-8", "surrogateescape"))
+    return raw.decode("utf-8", "replace")
+
+
 def resolve_network() -> dict:
-    """{printer-display-name: {"uri": ipps://host:port/rp, "web": https://host/}}."""
+    """{service name: {"uri", "web", "addrs": [(family, addr, port, iface)]}}.
+
+    Every announced address is kept, IPv4 first, so a printer that only has
+    an IPv6 (link-local) address can still be reached.
+    """
     found: dict = {}
     for service, scheme in (("_ipps._tcp", "ipps"), ("_ipp._tcp", "ipp")):
         try:
@@ -257,59 +328,90 @@ def resolve_network() -> dict:
             f = line.split(";")
             if len(f) < 10 or f[0] != "=":
                 continue
-            name = f[3].replace("\\032", " ")
-            proto, host, addr, port, txt = f[2], f[6], f[7], f[8], f[9]
+            iface, name = f[1], avahi_unescape(f[3])
+            host, addr, port, txt = f[6].rstrip("."), f[7], f[8], f[9]
             if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host) or not port.isdigit():
                 continue
             rp = re.search(r'"rp=([^"]*)"', txt)
             path = rp.group(1) if rp and re.fullmatch(r"[A-Za-z0-9/_.-]{0,64}", rp.group(1)) else "ipp/print"
-            host = host.rstrip(".")
-            if not re.fullmatch(r"[0-9.]{7,15}|[0-9A-Fa-f:]{2,39}", addr):
-                addr = ""
-            entry = {"uri": f"{scheme}://{host}:{port}/{path}", "web": f"https://{host}/",
-                     "addr": addr, "port": int(port), "v4": proto == "IPv4"}
-            old = found.get(name)
-            # Prefer IPPS, then an IPv4 address (IPv6 link-local needs a scope).
-            if (old is None or (scheme == "ipps" and old["uri"].startswith("ipp:"))
-                    or (entry["v4"] and not old["v4"] and entry["uri"].split(":")[0] == old["uri"].split(":")[0])):
-                found[name] = entry
+            entry = found.get(name)
+            # One entry per service name; IPPS wins over IPP.
+            if entry is None or (scheme == "ipps" and entry["uri"].startswith("ipp:")):
+                entry = found[name] = {"uri": f"{scheme}://{host}:{port}/{path}",
+                                       "web": f"https://{host}/", "addrs": []}
+            if not entry["uri"].startswith(scheme + ":"):
+                continue
+            # The proto column is the network the announcement came over, not
+            # the address family, so go by the address itself.
+            if IPV4_RE.match(addr):
+                cand = ("v4", addr, int(port), "")
+            elif IPV6_RE.match(addr) and IFACE_RE.match(iface):
+                cand = ("v6", addr, int(port), iface)
+            else:
+                continue
+            if cand not in entry["addrs"] and len(entry["addrs"]) < MAX_ADDRS:
+                entry["addrs"].append(cand)
+    for entry in found.values():
+        entry["addrs"].sort(key=lambda a: a[0] != "v4")
     return found
 
 
+DNSSD_RE = re.compile(r"^(?:ipps?|dnssd)://([^/?]+?)\._ipps?\._tcp\.(?:local|domain)\.?/?")
+PLAIN_RE = re.compile(r"^(ipps?)://(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+)(?::(\d+))?(/\S*)?$")
+
+
 def device_key(device_uri: str) -> str:
-    """DNS-SD service name from a dnssd device URI, else ''."""
-    m = re.match(r"^ipps?://([^/]+?)\._ipps?\._tcp\.local/?", device_uri or "")
+    """DNS-SD service name from a device URI, else ''.
+
+    CUPS writes these as ipps://Name._ipps._tcp.local/ or, when added through
+    system-config-printer and similar tools, dnssd://Name._ipps._tcp.local/.
+    """
+    m = DNSSD_RE.match(device_uri or "")
     return urllib.parse.unquote(m.group(1)) if m else ""
 
 
-def reach_target(device_uri: str, network: dict) -> tuple[str, int] | None:
-    """(address, port) to knock on for a network printer, else None."""
+def is_network(device_uri: str) -> bool:
+    return bool(device_key(device_uri) or PLAIN_RE.match(device_uri or ""))
+
+
+def reach_targets(device_uri: str, network: dict) -> list:
+    """Candidate socket addresses to knock on, best first."""
     key = device_key(device_uri)
-    if key and key in network and network[key].get("addr") and network[key].get("v4"):
-        return network[key]["addr"], network[key]["port"]
-    m = re.match(r"^(ipps?)://([A-Za-z0-9.-]+)(?::(\d+))?(/\S*)?$", device_uri or "")
-    if m and not device_key(device_uri):
-        return m.group(2), int(m.group(3) or 631)
-    return None
+    if key:
+        return list((network.get(key) or {}).get("addrs", []))
+    m = PLAIN_RE.match(device_uri or "")
+    if m:
+        return [("name", m.group(2).strip("[]"), int(m.group(3) or 631), "")]
+    return []
 
 
-def knock(target: tuple[str, int]) -> bool:
-    try:
-        with socket.create_connection(target, timeout=REACH_TIMEOUT):
+def knock(targets: list) -> bool:
+    """True if any candidate accepts a TCP connection within REACH_TIMEOUT."""
+    for family, addr, port, iface in targets:
+        try:
+            if family == "v6":
+                scope = socket.if_nametoindex(iface) if iface else 0
+                with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+                    s.settimeout(REACH_TIMEOUT)
+                    s.connect((addr, port, 0, scope))
+            else:
+                with socket.create_connection((addr, port), timeout=REACH_TIMEOUT):
+                    pass
             return True
-    except OSError:
-        return False
+        except OSError:
+            continue
+    return False
 
 
 def direct_uri(device_uri: str, network: dict) -> tuple[str, str]:
     """(uri to query the printer itself, its web page) or ('', '')."""
     key = device_key(device_uri)
-    if key and key in network:
-        return network[key]["uri"], network[key]["web"]
-    m = re.match(r"^(ipps?)://([A-Za-z0-9.-]+)(:\d+)?(/\S*)?$", device_uri or "")
-    if m:
-        host = m.group(2)
-        return device_uri, f"https://{host}/"
+    if key:
+        entry = network.get(key)
+        return (entry["uri"], entry["web"]) if entry else ("", "")
+    m = PLAIN_RE.match(device_uri or "")
+    if m and not m.group(2).startswith("["):
+        return device_uri, f"https://{m.group(2)}/"
     return "", ""
 
 
@@ -330,91 +432,258 @@ def notify(title: str, body: str = "", urgent: bool = False) -> None:
         pass
 
 
+# ---------------------------------------------------------------- network thread
+
+class NetWatch(threading.Thread):
+    """Avahi lookups, knocks and direct printer queries, off the main thread.
+
+    The main thread hands over the current device URIs with set_printers()
+    and reads results with snapshot(). Whenever a result changes what the
+    panel shows, a byte is written to `wake_fd` so the main thread re-emits.
+    """
+
+    def __init__(self, files: dict, wake_fd: int):
+        super().__init__(daemon=True)
+        self.files = files
+        self.wake_fd = wake_fd
+        self.lock = threading.Lock()
+        self.kick = threading.Event()
+        self.printers: dict = {}         # name -> device-uri (set by main)
+        self.network: dict = {}
+        self.misses: dict = {}
+        self.device: dict = {}           # name -> fresh readings
+        self.resolved_at = 0.0
+        self.device_at = 0.0
+        self.want_device = True
+
+    def set_printers(self, printers: dict) -> None:
+        with self.lock:
+            changed = printers != self.printers
+            self.printers = dict(printers)
+        if changed:
+            self.kick.set()
+
+    def request_device(self) -> None:
+        with self.lock:
+            self.want_device = True
+        self.kick.set()
+
+    def snapshot(self) -> tuple[dict, set, dict]:
+        with self.lock:
+            offline = {n for n, k in self.misses.items() if k >= OFFLINE_AFTER}
+            return dict(self.network), offline, {k: dict(v) for k, v in self.device.items()}
+
+    def wake(self) -> None:
+        try:
+            os.write(self.wake_fd, b"n")
+        except OSError:
+            pass
+
+    def run(self) -> None:
+        while True:
+            try:
+                self.cycle()
+            except Exception:  # noqa: BLE001 - never let the thread die
+                pass
+            self.kick.wait(KNOCK_EVERY)
+            self.kick.clear()
+
+    def cycle(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            printers = dict(self.printers)
+            network = dict(self.network)
+        net_printers = {n: u for n, u in printers.items() if is_network(u)}
+        if not net_printers:
+            return
+
+        unresolved = any(device_key(u) and device_key(u) not in network for u in net_printers.values())
+        if now - self.resolved_at > (RESOLVE_RETRY if unresolved else RESOLVE_EVERY) or not self.resolved_at:
+            fresh = resolve_network()
+            self.resolved_at = now
+            # Merge, so a printer that is off right now keeps its last addresses.
+            network = {**network, **fresh}
+            with self.lock:
+                self.network = network
+            self.wake()  # web page links may have appeared
+
+        changed = False
+        back = False
+        for name, uri in net_printers.items():
+            targets = reach_targets(uri, network)
+            ok = bool(targets) and knock(targets)
+            with self.lock:
+                before = self.misses.get(name, 0)
+                self.misses[name] = 0 if ok else before + 1
+                after = self.misses[name]
+            if (before >= OFFLINE_AFTER) != (after >= OFFLINE_AFTER):
+                changed = True
+                back = back or ok
+        if changed:
+            self.wake()
+
+        with self.lock:
+            due = self.want_device or back or now - self.device_at > DEVICE_EVERY
+            self.want_device = False
+        if not due:
+            return
+        self.device_at = now
+        retry = False
+        for name, uri in net_printers.items():
+            with self.lock:
+                missed = self.misses.get(name, 0) > 0
+            target, _ = direct_uri(uri, network)
+            # Skip printers that just missed a knock: the query would only
+            # sit out its timeout.
+            if not target or missed:
+                continue
+            r = run_ipptool(target, self.files["device"])
+            attrs = r[0][0] if r and r[0] else None
+            if attrs and attrs.get("marker-names"):
+                attrs["_at"] = str(int(time.time()))
+                with self.lock:
+                    self.device[name] = attrs
+                self.wake()
+            else:
+                retry = True  # a sleeping printer can miss a query
+        if retry:
+            self.device_at = now - DEVICE_EVERY + 60
+
+
+# ---------------------------------------------------------------- CUPS events
+
+def die_with_parent() -> None:
+    """Child setup: get SIGTERM if this script dies, however it dies."""
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+    except OSError:
+        pass
+
+
+class Events:
+    """CUPS job/printer events over D-Bus, through a leased subscription.
+
+    `fd` is readable whenever dbus-monitor saw a CUPS signal; `ok` is False if
+    events could not be set up, in which case the main loop polls more often.
+    """
+
+    def __init__(self, files: dict):
+        self.files = files
+        self.proc = None
+        self.sub_id = 0
+        self.renew_at = 0.0
+        self.fd = -1
+        self.ok = False
+        self.start()
+
+    def start(self) -> None:
+        self.stop()
+        try:
+            self.proc = subprocess.Popen(
+                [DBUS_MONITOR, "--system", "type='signal',interface='org.cups.cupsd.Notifier'"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                preexec_fn=die_with_parent)
+        except OSError:
+            return
+        self.fd = self.proc.stdout.fileno()
+        fl = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        r = run_ipptool("ipp://localhost/", self.files["subscribe"])
+        sub = r[0][0] if r and r[0] else {}
+        self.sub_id = to_int(sub.get("notify-subscription-id"), 0)
+        self.renew_at = time.monotonic() + SUB_LEASE / 2
+        self.ok = self.sub_id > 0
+
+    def alive(self) -> bool:
+        return bool(self.proc) and self.proc.poll() is None
+
+    def drain(self) -> bool:
+        """Read what dbus-monitor printed; True if it held a CUPS signal."""
+        got = False
+        try:
+            for _ in range(64):  # bounded: at most 256 KiB per wake-up
+                chunk = os.read(self.fd, 4096)
+                if not chunk:
+                    break
+                if b"member=Job" in chunk or b"member=Printer" in chunk:
+                    got = True
+        except BlockingIOError:
+            pass
+        except OSError:
+            pass
+        return got
+
+    def maintain(self) -> None:
+        if not self.alive():
+            self.start()
+        elif self.ok and time.monotonic() > self.renew_at:
+            self.renew_at = time.monotonic() + SUB_LEASE / 2
+            # If CUPS lost the subscription (a restart), make a new one.
+            if not ipptool_ok("ipp://localhost/", self.files["renew"], {"subid": self.sub_id}):
+                self.sub_id = 0
+                self.start()
+
+    def stop(self) -> None:
+        if self.sub_id > 0:
+            ipptool_ok("ipp://localhost/", self.files["unsubscribe"], {"subid": self.sub_id})
+            self.sub_id = 0
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+        self.fd = -1
+        self.ok = False
+
+
 # ---------------------------------------------------------------- main loop
 
 class Monitor:
-    def __init__(self, tmpdir: str):
+    def __init__(self, tmpdir: str, net: NetWatch | None = None):
         self.files = {}
         for name, body in TESTS.items():
             path = os.path.join(tmpdir, name + ".test")
             with open(path, "w") as fh:
                 fh.write(body)
             self.files[name] = path
-        self.network: dict = {}
-        self.resolved_at = 0.0
-        self.device: dict = {}          # printer name -> fresh readings
-        self.device_at = 0.0
+        self.net = net
+        self.cups: tuple = ([], [], [], "")  # last scheduler answer
+        self.cups_ok = False
         self.active_jobs: dict = {}     # job id -> (name, printer)
         self.problems: set = set()      # (printer, keyword) already notified
         self.low: set = set()           # (printer, marker) already notified
-        self.misses: dict = {}          # printer name -> missed knocks in a row
         self.offline_told: set = set()  # printers already announced as offline
         self.first = True
         self.last = ""
         self.busy = False
 
-    def poll(self, force_device: bool = False) -> dict:
-        now = time.monotonic()
+    def poll_cups(self) -> None:
         res = run_ipptool("ipp://localhost/", self.files["cups"])
         if len(res) < 3:
+            self.cups_ok = False
+            return
+        printers_raw = [p for p in res[0] if p.get("printer-name")][:MAX_PRINTERS]
+        default = res[3][0].get("printer-name", "") if len(res) > 3 and res[3] else ""
+        self.cups = (printers_raw, res[1], res[2], default)
+        self.cups_ok = True
+        if self.net:
+            self.net.set_printers({p["printer-name"]: p.get("device-uri", "") for p in printers_raw})
+
+    def build(self) -> dict:
+        if not self.cups_ok:
             return {"ok": False, "error": "CUPS is not answering", "printers": [], "jobs": []}
-        printers_raw, jobs_raw, done_raw = res[0], res[1], res[2]
-
-        unresolved = any(device_key(p.get("device-uri", "")) and
-                         device_key(p.get("device-uri", "")) not in self.network
-                         for p in printers_raw[:MAX_PRINTERS])
-        wait = RESOLVE_RETRY if unresolved else RESOLVE_EVERY
-        if now - self.resolved_at > wait or not self.resolved_at:
-            # Merge, so a printer that is off right now keeps its last address.
-            self.network = {**self.network, **resolve_network()}
-            self.resolved_at = now
-
-        # Is each network printer still there?
-        offline = set()
-        for p in printers_raw[:MAX_PRINTERS]:
-            name = p.get("printer-name", "")
-            target = reach_target(p.get("device-uri", ""), self.network)
-            key = device_key(p.get("device-uri", ""))
-            if not name or (target is None and not key):
-                continue  # USB or other local printer: CUPS knows best
-            # A network printer that is not even announced on the network
-            # counts as a miss, just like one that does not answer.
-            if target is not None and knock(target):
-                if self.misses.get(name, 0) >= OFFLINE_AFTER:
-                    force_device = True  # back online: read fresh toner now
-                self.misses[name] = 0
-            else:
-                self.misses[name] = self.misses.get(name, 0) + 1
-            if self.misses[name] >= OFFLINE_AFTER:
-                offline.add(name)
-
-        # Fresh readings from network printers: toner, loaded paper, alerts.
-        if force_device or now - self.device_at > DEVICE_EVERY:
-            self.device_at = now
-            for p in printers_raw[:MAX_PRINTERS]:
-                uri, _ = direct_uri(p.get("device-uri", ""), self.network)
-                # Skip printers that just missed a knock: the query would only
-                # sit out its timeout.
-                if not uri or self.misses.get(p.get("printer-name", ""), 0) > 0:
-                    continue
-                r = run_ipptool(uri, self.files["device"])
-                attrs = r[0][0] if r and r[0] else None
-                # A sleeping printer can miss a query: keep the last good
-                # readings and try again sooner.
-                if attrs and attrs.get("marker-names"):
-                    attrs["_at"] = int(time.time())
-                    self.device[p.get("printer-name", "")] = attrs
-                else:
-                    self.device_at = now - DEVICE_EVERY + 60
+        printers_raw, jobs_raw, done_raw, default = self.cups
+        network, offline, device = self.net.snapshot() if self.net else ({}, set(), {})
 
         printers = []
-        printers_raw = [p for p in printers_raw if p.get("printer-name")]
-        for p in printers_raw[:MAX_PRINTERS]:
+        for p in printers_raw:
             name = p.get("printer-name", "")
             if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,127}", name):
                 continue
-            uri, web = direct_uri(p.get("device-uri", ""), self.network)
-            dev = self.device.get(name)
+            _, web = direct_uri(p.get("device-uri", ""), network)
+            dev = device.get(name)
             reasons = reasons_from(p.get("printer-state-reasons", ""))
             if dev:
                 for r in reasons_from(dev.get("printer-state-reasons", "")):
@@ -437,7 +706,7 @@ class Monitor:
                 "markers": markers,
                 "media": media_label((dev or {}).get("media-ready", "")),
                 "alert": alert,
-                "readingsAt": int((dev or {}).get("_at", 0)),
+                "readingsAt": to_int((dev or {}).get("_at", 0), 0),
                 "web": web if re.fullmatch(r"https?://[A-Za-z0-9.-]+/", web or "") else "",
             })
 
@@ -451,7 +720,7 @@ class Monitor:
             state = job_state(j.get("job-state")) or "pending"
             printer = j.get("job-printer-uri", "").rsplit("/", 1)[-1]
             jname = j.get("job-name", "")
-            current[jid] = (jname, printer)
+            current[jid] = (jname, printer, state)
             if len(jobs) < MAX_JOBS:
                 jobs.append({
                     "id": jid,
@@ -464,26 +733,24 @@ class Monitor:
                 })
 
         finished = {to_int(j.get("job-id"), 0): j for j in done_raw if to_int(j.get("job-id"), 0) > 0}
-        if not self.first:
-            self.notify_changes(printers, current, finished)
-        else:
+        if self.first:
             self.seed(printers)
+        else:
+            self.notify_changes(printers, current, finished)
         # A job just left the queue: read fresh toner soon.
-        if any(jid not in current for jid in self.active_jobs):
-            self.device_at = 0.0
+        if self.net and any(jid not in current for jid in self.active_jobs):
+            self.net.request_device()
         self.active_jobs = current
         self.first = False
-        self.busy = bool(current) or any(p["state"] == "processing" for p in printers)
-
-        default = ""
-        try:
-            out = subprocess.run([LPSTAT, "-d"], capture_output=True, text=True, timeout=5,
-                                 stdin=subprocess.DEVNULL).stdout
-            m = re.search(r"destination: (\S+)", out)
-            default = m.group(1) if m else ""
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        # Poll fast only while something is actually printing; a job waiting
+        # for an offline printer does not need a 2-second loop.
+        self.busy = (any(s == "printing" for _, _, s in current.values())
+                     or any(p["state"] == "processing" for p in printers))
         return {"ok": True, "default": clip(default, 127), "printers": printers, "jobs": jobs}
+
+    def poll(self) -> dict:
+        self.poll_cups()
+        return self.build()
 
     def seed(self, printers: list) -> None:
         """Remember conditions present at start, so they are not announced."""
@@ -497,7 +764,7 @@ class Monitor:
                     self.low.add((p["name"], m["name"]))
 
     def notify_changes(self, printers: list, current: dict, finished: dict) -> None:
-        for jid, (jname, printer) in self.active_jobs.items():
+        for jid, (jname, _printer, _state) in self.active_jobs.items():
             if jid in current:
                 continue
             state = job_state((finished.get(jid) or {}).get("job-state"))
@@ -536,8 +803,8 @@ class Monitor:
         if len(line) > MAX_RECORD:
             payload = dict(payload, jobs=[], printers=[dict(p, markers=[], reasons=p["reasons"][:2])
                                                         for p in payload.get("printers", [])])
-            line = json.dumps(payload, separators=(",", ":"))[:MAX_RECORD]
-            if len(line) >= MAX_RECORD:
+            line = json.dumps(payload, separators=(",", ":"))
+            if len(line) > MAX_RECORD:
                 line = json.dumps({"ok": False, "error": "status too large", "printers": [], "jobs": []})
         if line != self.last:
             self.last = line
@@ -546,27 +813,58 @@ class Monitor:
 
 def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     tmpdir = tempfile.mkdtemp(prefix="omarchy-printer-")
+    events = None
     try:
+        wake_r, wake_w = os.pipe()
+        os.set_blocking(wake_r, False)
         mon = Monitor(tmpdir)
-        force = False
+        net = NetWatch(mon.files, wake_w)
+        mon.net = net
+        mon.poll_cups()
+        net.start()
+        events = Events(mon.files)
+        next_poll = 0.0
         while True:
-            mon.emit(mon.poll(force_device=force))
-            force = False
-            wait = POLL_ACTIVE if mon.busy else POLL_IDLE
+            now = time.monotonic()
+            if now >= next_poll:
+                mon.poll_cups()
+                interval = POLL_ACTIVE if mon.busy else (POLL_IDLE if events.ok else POLL_IDLE_NO_EVENTS)
+                next_poll = now + interval
+            mon.emit(mon.build())
+            # build() may have changed `busy`; tighten the schedule if so.
+            if mon.busy:
+                next_poll = min(next_poll, time.monotonic() + POLL_ACTIVE)
+
+            watch = [wake_r, sys.stdin] + ([events.fd] if events.fd >= 0 else [])
             try:
-                ready, _, _ = select.select([sys.stdin], [], [], wait)
+                ready, _, _ = select.select(watch, [], [], max(0.05, next_poll - time.monotonic()))
             except (OSError, ValueError):
                 ready = []
-                time.sleep(wait)
-            if ready:
+                time.sleep(1)
+            if wake_r in ready:
+                try:
+                    os.read(wake_r, 4096)
+                except OSError:
+                    pass
+            if sys.stdin in ready:
                 line = sys.stdin.readline(64)
-                if not line:  # stdin closed: keep polling on the timer
-                    sys.stdin = open(os.devnull)
+                if not line:
+                    return 0  # the panel went away
                 elif line.strip() == "refresh":
-                    force = True
+                    next_poll = 0.0
+                    net.request_device()
+            if events.fd >= 0 and events.fd in ready and events.drain():
+                # Let a burst of signals settle, then poll once.
+                time.sleep(EVENT_DEBOUNCE)
+                events.drain()
+                next_poll = 0.0
+            events.maintain()
     finally:
+        if events:
+            events.stop()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

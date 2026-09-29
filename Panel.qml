@@ -165,7 +165,67 @@ Panel {
     close()
   }
 
-  onOpenedChanged: if (opened) { testArmed = false; refresh() }
+  // ---------- Keyboard cursor ----------
+  // Everything you can act on, top to bottom, as the stock panels do:
+  // arrows or h/j/k/l move, Enter or Space acts, x cancels the job under the
+  // cursor, r refreshes. The four action buttons form a 2x2 grid.
+  property bool cursorActive: false
+  property int cursorIndex: 0
+
+  readonly property var focusItems: {
+    var out = []
+    if (printers.length > 1)
+      for (var i = 0; i < printers.length; i++) out.push("pick:" + i)
+    for (var j = 0; j < jobs.length; j++)
+      if (jobs[j].mine) out.push("job:" + jobs[j].id)
+    if (myJobs.length > 1) out.push("cancelAll")
+    if (printer) {
+      out.push("pause", "test")
+      out.push(printer.web !== "" ? "web" : "web-off", "settings")
+    }
+    return out
+  }
+  readonly property string cursorItem: cursorActive && cursorIndex < focusItems.length ? focusItems[cursorIndex] : ""
+  onFocusItemsChanged: if (cursorIndex >= focusItems.length) cursorIndex = Math.max(0, focusItems.length - 1)
+
+  function hasCursor(key) { return cursorItem === key }
+
+  function moveCursor(dx, dy) {
+    var items = focusItems
+    if (!items.length) return
+    if (!cursorActive) { cursorActive = true; cursorIndex = 0; return }
+    var grid = items.indexOf("pause")
+    var i = cursorIndex
+    var t
+    if (grid >= 0 && i >= grid) {
+      // In the 2x2 grid: left/right within a row, up/down between rows.
+      var col = (i - grid) % 2, row = Math.floor((i - grid) / 2)
+      if (dx !== 0) t = grid + row * 2 + Math.max(0, Math.min(1, col + dx))
+      else if (row + dy < 0) t = grid - 1
+      else t = grid + Math.min(1, row + dy) * 2 + col
+    } else {
+      t = i + (dy !== 0 ? dy : dx)
+    }
+    if (t < 0) t = 0
+    if (t >= items.length) t = items.length - 1
+    if (items[t] === "web-off") t = t + (t > i ? 1 : -1)
+    cursorIndex = Math.max(0, Math.min(items.length - 1, t))
+  }
+
+  function activate(key) {
+    if (key.indexOf("pick:") === 0) {
+      var p = printers[parseInt(key.substring(5), 10)]
+      if (p) chosenName = p.name
+    } else if (key.indexOf("job:") === 0) {
+      cancelJob(key.substring(4))
+    } else if (key === "cancelAll") cancelMine()
+    else if (key === "pause") togglePause()
+    else if (key === "test") printTestPage()
+    else if (key === "web") openWeb()
+    else if (key === "settings") openSettings()
+  }
+
+  onOpenedChanged: if (opened) { testArmed = false; cursorActive = false; cursorIndex = 0; refresh() }
 
   // ---------- Bar icon ----------
   BarIconButton {
@@ -253,6 +313,10 @@ Panel {
       anchors.fill: parent
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
+      onActivateRequested: if (root.cursorItem !== "") root.activate(root.cursorItem)
+      onDeleteRequested: if (root.cursorItem.indexOf("job:") === 0) root.activate(root.cursorItem)
+      onTextKey: function(t) { if (t === "r" || t === "R") root.refresh() }
 
       Column {
         id: column
@@ -289,6 +353,7 @@ Panel {
               fontFamily: root.ff
               foreground: root.barForeground
               selected: !!root.printer && !!p && p.name === root.printer.name
+              hasCursor: root.hasCursor("pick:" + index)
               bordered: true
               horizontalPadding: Style.spacing.controlPaddingX
               verticalPadding: Style.spacing.controlPaddingY
@@ -524,6 +589,7 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 visible: j.mine === true
                 iconText: "\u{f0156}" // nf-md-close
+                hasCursor: root.hasCursor("job:" + j.id)
                 tooltipText: "Cancel"
                 foreground: root.barForeground
                 hoverColor: root.urgent
@@ -538,6 +604,7 @@ Panel {
             visible: root.myJobs.length > 1
             width: parent.width
             text: "Cancel all my jobs"
+            hasCursor: root.hasCursor("cancelAll")
             fontSize: Style.font.bodySmall
             foreground: root.barForeground
             fontFamily: root.ff
@@ -565,6 +632,7 @@ Panel {
             iconText: root.paused ? "\u{f040a}" : "\u{f03e4}" // play / pause
             iconSize: Style.font.icon
             text: root.paused ? "Resume" : "Pause"
+            hasCursor: root.hasCursor("pause")
             tooltipText: "Needs your password"
             fontSize: Style.font.bodySmall
             foreground: root.barForeground
@@ -579,7 +647,8 @@ Panel {
             width: parent.cellWidth
             iconText: "\u{f0219}" // nf-md-file
             iconSize: Style.font.icon
-            text: root.testArmed ? "Click to print" : "Test page"
+            text: root.testArmed ? "Again to print" : "Test page"
+            hasCursor: root.hasCursor("test")
             fontSize: Style.font.bodySmall
             foreground: root.testArmed ? root.urgent : root.barForeground
             fontFamily: root.ff
@@ -595,6 +664,7 @@ Panel {
             iconText: "\u{f059f}" // nf-md-web
             iconSize: Style.font.icon
             text: "Web page"
+            hasCursor: root.hasCursor("web")
             fontSize: Style.font.bodySmall
             foreground: root.barForeground
             fontFamily: root.ff
@@ -609,6 +679,7 @@ Panel {
             iconText: "\u{f0493}" // nf-md-cog
             iconSize: Style.font.icon
             text: "Settings"
+            hasCursor: root.hasCursor("settings")
             fontSize: Style.font.bodySmall
             foreground: root.barForeground
             fontFamily: root.ff

@@ -20,12 +20,14 @@ drivers, vendor tools or extra packages.
   even though CUPS itself only notices when it next tries to print.
 - **Print queue** with a cancel button on each of your jobs, and *Cancel all
   my jobs*.
-- **Actions:** pause or resume the printer, print a test page (click twice to
+- **Actions:** pause or resume the printer, print a test page (press twice to
   confirm), open the printer's own web page, open printer settings.
 - **Notifications** when a job finishes or fails, when paper runs out or jams,
   once when a toner runs low, and once when a job is waiting for a printer
   that is offline.
 - **Several printers:** a picker appears when more than one is set up.
+- **Keyboard control** like the stock panels: arrows or h/j/k/l, Enter, x to
+  cancel a job.
 
 ## Requirements
 
@@ -41,6 +43,7 @@ plugin downloads nothing and needs no printer drivers or vendor tools.
 | `avahi` | `avahi-browse`, to find network printers and their web page |
 | `nss-mdns` | resolving `.local` printer names |
 | `python` | the status script (standard library only, no pip packages) |
+| `dbus` | `dbus-monitor`, to hear CUPS job and printer events instead of polling |
 | `libnotify` | `notify-send`, for notifications |
 | `polkit` | `pkexec`, for the password prompt when pausing or resuming |
 | `xdg-utils` | `xdg-open`, for the printer's web page |
@@ -50,7 +53,7 @@ plugin downloads nothing and needs no printer drivers or vendor tools.
 Install anything missing with:
 
 ```sh
-omarchy pkg add cups cups-filters avahi nss-mdns python libnotify polkit xdg-utils system-config-printer
+omarchy pkg add cups cups-filters avahi nss-mdns python dbus libnotify polkit xdg-utils system-config-printer
 ```
 
 The CUPS and Avahi services must be running, and `mdns_minimal` must be in the
@@ -63,7 +66,8 @@ sudo systemctl enable --now cups.socket avahi-daemon.service
 You also need a printer already added to CUPS (Omarchy's printer setup, or
 `system-config-printer`). Toner and paper readings need a printer that speaks
 IPP (any AirPrint, IPP Everywhere or Mopria printer); others still show status
-and the queue.
+and the queue. Network printers are recognised whether CUPS has them as
+`ipps://…`, `ipp://…` or `dnssd://…`, over IPv4 or IPv6.
 
 ## Install
 
@@ -96,8 +100,17 @@ Nothing else is left behind.
 | right-click the bar icon | open printer settings |
 | ✕ next to a job | cancel that job |
 | Pause / Resume | stop or restart the printer (asks for your password) |
-| Test page | click twice within 3 seconds to print CUPS's test page (`default-testpage.pdf`) |
+| Test page | press twice within 3 seconds to print CUPS's test page (`default-testpage.pdf`) |
 | Web page | open the printer's built-in web page |
+
+Keyboard, as in the stock panels:
+
+| Key | Action |
+|---|---|
+| ↑ ↓ ← → or h j k l | move between printers, jobs and buttons |
+| Enter / Space | act on the highlighted item |
+| x | cancel the highlighted job |
+| r | refresh now |
 | Tab / Shift+Tab | switch to the next bar panel |
 | Esc | close |
 
@@ -118,21 +131,36 @@ colour so it stays visible on a dark bar.
 
 ## How it works
 
-`bin/omarchy-printer` is one long-lived Python process. It:
+`bin/omarchy-printer` is one long-lived Python process with two threads.
 
-1. asks the local CUPS scheduler (`ipptool`) for printers, their state and the
-   queue — every 2 seconds while anything is printing, every 15 seconds
-   otherwise;
-2. on each poll, opens and closes a connection to each network printer (2 s
-   limit, no new process); two misses in a row, or a printer no longer
-   announced on the network, mean Offline;
-3. finds network printers with `avahi-browse` and asks them directly for
-   toner, loaded paper and alerts every 5 minutes, and right after a job
-   finishes;
-4. prints one JSON line to the panel only when something changed, and sends
-   notifications itself.
+**Main thread — CUPS.** One `ipptool` run asks the local scheduler for
+printers, jobs and the default printer. The script holds a short-lease CUPS
+subscription (renewed every 5 minutes, cancelled on exit) that announces job
+and printer changes over D-Bus, so updates appear at once and the scheduler
+is otherwise only polled every 60 seconds as a safety net — every 2 seconds
+while a job is printing, and every 15 seconds if D-Bus events are
+unavailable.
 
-The panel sends it `refresh` after an action so the result shows at once.
+**Network thread — the printers themselves.** Everything that can be slow
+runs here, so it never delays the panel:
+
+1. `avahi-browse` finds each network printer's addresses (IPv4 and IPv6) and
+   web page;
+2. every 15 seconds a TCP connection is opened and closed to each network
+   printer (2 s limit, no new process); two misses in a row, or a printer no
+   longer announced on the network, mean Offline — CUPS itself only notices
+   when it next sends a job;
+3. printers are asked directly for toner, loaded paper and alerts every 5
+   minutes, right after a job finishes, and as soon as an offline printer
+   answers again.
+
+One JSON line goes to the panel only when something changed. The panel sends
+`refresh` after an action so the result shows at once. The script exits when
+the panel closes, and its `dbus-monitor` child is tied to it so it cannot be
+left behind.
+
+Idle, the whole thing measures about 0 ms of CPU per minute and 18 MB of
+memory.
 
 **Bounds.** At most 8 printers, 8 toners and 20 jobs per record, text fields
 clipped to 80 characters, and each record capped at 32 KB. All
