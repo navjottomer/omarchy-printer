@@ -93,7 +93,7 @@ Nothing else is left behind.
 | right-click the bar icon | open printer settings |
 | ✕ next to a job | cancel that job |
 | Pause / Resume | stop or restart the printer (asks for your password) |
-| Test page | click twice within 3 seconds to print CUPS's test page |
+| Test page | click twice within 3 seconds to print CUPS's test page (`default-testpage.pdf`) |
 | Web page | open the printer's built-in web page |
 | Tab / Shift+Tab | switch to the next bar panel |
 | Esc | close |

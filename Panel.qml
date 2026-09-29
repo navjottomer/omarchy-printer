@@ -146,7 +146,10 @@ Panel {
     if (!safeName) return
     if (!testArmed) { testArmed = true; disarm.restart(); return }
     testArmed = false
-    run(["/usr/bin/lp", "-d", safeName, "-t", "Test page", "/usr/share/cups/data/testprint"])
+    // The PDF itself, not CUPS's "testprint" banner: on cups-filters 2.x the
+    // banner's bannertopdf -> pdftopdf step can fail ("universal filter
+    // failed") while plain PDFs print fine.
+    run(["/usr/bin/lp", "-d", safeName, "-t", "Test page", "/usr/share/cups/data/default-testpage.pdf"])
   }
 
   function openWeb() {
