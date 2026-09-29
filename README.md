@@ -26,9 +26,10 @@ drivers, vendor tools or extra packages.
 
 ## Requirements
 
-Every package below is in the official Arch repositories, and all but
-`system-config-printer` come with a standard Omarchy install. The plugin
-downloads nothing and needs no printer drivers or vendor tools.
+Every package below is in the official Arch repositories. Omarchy's base
+install lists `cups`, `cups-filters`, `avahi`, `nss-mdns`, `uwsm` and
+`system-config-printer`; the rest are normally pulled in as dependencies. The
+plugin downloads nothing and needs no printer drivers or vendor tools.
 
 | Package | Used for |
 |---|---|
