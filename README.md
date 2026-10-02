@@ -1,16 +1,17 @@
 # Omarchy Printer
 
-Printer status, toner levels and the print queue in the Omarchy bar. Uses only
-what every Omarchy install already has — CUPS and Avahi — with no printer
-drivers, vendor tools or extra packages.
+Printer status, toner levels, the print queue and scanning in the Omarchy bar.
+Uses only what every Omarchy install already has — CUPS, Avahi and Python —
+with no printer drivers, scanner drivers, vendor tools or extra packages.
 
-<p align="center"><img src="preview.png" alt="Printer panel in the Omarchy bar" width="480"></p>
+<p align="center"><img src="preview.png" alt="Printer tab and Scan tab of the printer panel" width="760"></p>
 
 ## Features
 
 - **Bar icon** that turns red on a problem (paper jam, out of paper, cover
-  open, toner empty) and shows a crossed-out printer when the printer is
-  paused or offline. Hover it for a one-line status.
+  open, toner empty), shows a hollow printer when the printer is paused, a
+  crossed-out printer when it is offline, and a scanner while a scan runs.
+  Hover it for a one-line status.
 - **Toner levels** in the printer's own colours, read straight from network
   printers so they are current, not only updated during a print job. Low toner
   turns red.
@@ -25,6 +26,16 @@ drivers, vendor tools or extra packages.
 - **Notifications** when a job finishes or fails, when paper runs out or jams,
   once when a toner runs low, and once when a job is waiting for a printer
   that is offline.
+- **Scanning** on a **Scan** tab, for network multifunction printers that
+  support AirScan (eSCL) — most from the last ten years:
+  - source: **Auto** (the document feeder when paper is in it, else the
+    glass), glass or feeder; a stack in the feeder becomes one scan
+  - colour, grey or black and white; 100, 200, 300 or 600 dpi
+  - A4, Letter, Legal or the largest area the scanner allows
+  - PDF or JPEG, saved to `~/Pictures/Scans` (your XDG pictures folder); a
+    stack from the feeder becomes one PDF
+  - optionally opens the file when done; **Open** and **Folder** buttons for
+    the last scan; Cancel stops the scan on the scanner too
 - **Several printers:** a picker appears when more than one is set up.
 - **Keyboard control** like the stock panels: arrows or h/j/k/l, Enter, x to
   cancel a job.
@@ -48,6 +59,8 @@ plugin downloads nothing and needs no printer drivers or vendor tools.
 | `polkit` | `pkexec`, for the password prompt when pausing or resuming |
 | `xdg-utils` | `xdg-open`, for the printer's web page |
 | `uwsm` | launching printer settings (part of Omarchy) |
+| `xdg-user-dirs` | *optional*, finds your pictures folder for scans (else `~/Pictures`) |
+| `poppler` | *optional*, `pdfunite`: joins a feeder stack into one PDF on scanners that send one PDF per page |
 | `system-config-printer` | *optional*, the **Settings** button |
 
 Install anything missing with:
@@ -110,6 +123,8 @@ Keyboard, as in the stock panels:
 | ↑ ↓ ← → or h j k l | move between printers, jobs and buttons |
 | Enter / Space | act on the highlighted item |
 | x | cancel the highlighted job |
+| ← → on the tab row | switch between **Printer** and **Scan** |
+| ← → on a scan option | change it |
 | r | refresh now |
 | Tab / Shift+Tab | switch to the next bar panel |
 | Esc | close |
@@ -124,7 +139,15 @@ Set with `omarchy bar set navjottomer.printer <key> <value>`:
 | Key | Default | Meaning |
 |---|---|---|
 | `tonerColors` | `real` | `real`: each toner in its own colour; `theme`: the theme accent |
-| `notifications` | `true` | notify on finished jobs, paper problems and low toner |
+| `notifications` | `true` | notify on finished jobs, paper problems, low toner and finished scans |
+| `scanSource` | `auto` | `auto`, `platen` (glass) or `feeder` |
+| `scanColor` | `color` | `color`, `gray` or `bw` (black and white, PDF only) |
+| `scanDpi` | `300` | `100`, `200`, `300` or `600` |
+| `scanSize` | `a4` | `a4`, `letter`, `legal` or `max` |
+| `scanFormat` | `pdf` | `pdf` or `jpeg` |
+| `scanOpen` | `false` | open the file when a scan finishes |
+
+The scan settings are also on the **Scan** tab and are remembered.
 
 With real colours, a very dark toner (black) is drawn in the theme's text
 colour so it stays visible on a dark bar.
@@ -168,6 +191,27 @@ stopped. At most 8 printers, 8 toners and 20 jobs per record, text fields
 clipped to 80 characters, and each record capped at 32 KB. All
 printer-supplied text is shown as plain text, never as markup. Actions run
 with fixed arguments, never through a shell.
+
+## Scanning
+
+`bin/omarchy-printer-scan` starts when you press **Scan** and exits when the
+scan is done, so scanning costs nothing the rest of the time. It speaks eSCL,
+the HTTP-and-XML scan protocol behind AirScan and Mopria Scan:
+
+1. the status script finds the scanner the same way it finds the printer —
+   its `_uscans._tcp` (or `_uscan._tcp`) announcement under the printer's
+   host name — and tells the panel which sources, colours and formats it has;
+2. the helper checks the scanner is idle (and whether paper is in the
+   feeder, for **Auto**), sends the scan settings, and saves each document
+   the scanner returns until it reports there are no more pages;
+3. files are created in `~/Pictures/Scans` with `O_EXCL | O_NOFOLLOW`
+   relative to the folder opened without following symlinks, so a scan can
+   never overwrite or be redirected onto another file. Each document is
+   capped at 512 MB and replies from the scanner at 256 KB.
+
+The scanner's TLS certificate is not checked: printers ship self-signed ones,
+and the address comes from the local network's own announcement — the same
+trust CUPS gives an IPPS printer it found that way.
 
 ## License
 

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "navjottomer.printer",
   "name": "Printer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "navjottomer",
   "license": "MIT",
-  "description": "Printer status, toner levels and the print queue in the Omarchy bar, using only CUPS and Avahi",
+  "description": "Printer status, toner levels, the print queue and scanning in the Omarchy bar, using only CUPS, Avahi and eSCL",
   "kinds": [
     "bar-widget"
   ],
@@ -14,19 +14,27 @@
   },
   "barWidget": {
     "displayName": "Printer",
-    "description": "Printer status, toner and print queue",
+    "description": "Printer status, toner, print queue and scanning",
     "category": "Hardware",
     "aliases": [
-      "printer",
-      "print",
       "cups",
+      "print",
+      "printer",
+      "scan",
+      "scanner",
       "toner"
     ],
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "tonerColors": "real",
-      "notifications": true
+      "notifications": true,
+      "scanSource": "auto",
+      "scanColor": "color",
+      "scanDpi": "300",
+      "scanSize": "a4",
+      "scanFormat": "pdf",
+      "scanOpen": false
     },
     "schema": [
       {
@@ -44,6 +52,68 @@
         "type": "boolean",
         "label": "Notify on finished jobs, paper problems and low toner",
         "defaultValue": true
+      },
+      {
+        "key": "scanSource",
+        "type": "enum",
+        "label": "Scan source",
+        "options": [
+          "auto",
+          "platen",
+          "feeder"
+        ],
+        "defaultValue": "auto"
+      },
+      {
+        "key": "scanColor",
+        "type": "enum",
+        "label": "Scan colour",
+        "options": [
+          "color",
+          "gray",
+          "bw"
+        ],
+        "defaultValue": "color"
+      },
+      {
+        "key": "scanDpi",
+        "type": "enum",
+        "label": "Scan quality (dpi)",
+        "options": [
+          "100",
+          "200",
+          "300",
+          "600"
+        ],
+        "defaultValue": "300"
+      },
+      {
+        "key": "scanSize",
+        "type": "enum",
+        "label": "Scan page size",
+        "options": [
+          "a4",
+          "letter",
+          "legal",
+          "max"
+        ],
+        "defaultValue": "a4"
+      },
+      {
+        "key": "scanFormat",
+        "type": "enum",
+        "label": "Scan file format",
+        "options": [
+          "pdf",
+          "jpeg"
+        ],
+        "defaultValue": "pdf"
+      },
+      {
+        "key": "scanOpen",
+        "type": "boolean",
+        "label": "Open the file after scanning",
+        "defaultValue": false
       }
     ]
   }

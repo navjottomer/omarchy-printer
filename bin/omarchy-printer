@@ -108,7 +108,7 @@ TESTS = {
         'ATTR keyword requested-attributes printer-name,printer-info,printer-state,'
         'printer-state-reasons,printer-state-message,printer-is-accepting-jobs,'
         'queued-job-count,device-uri,marker-names,marker-levels,marker-low-levels,'
-        'marker-colors '
+        'marker-colors,printer-is-temporary '
         'STATUS successful-ok STATUS client-error-not-found }\n'
         '{ NAME "jobs" OPERATION Get-Jobs ' + HEADER +
         'ATTR uri printer-uri ipp://localhost/ ATTR name requesting-user-name $user '
@@ -378,7 +378,7 @@ def resolve_network() -> dict:
             # One entry per service name; IPPS wins over IPP.
             if entry is None or (scheme == "ipps" and entry["uri"].startswith("ipp:")):
                 entry = found[name] = {"uri": f"{scheme}://{host}:{port}/{path}",
-                                       "web": f"https://{host}/", "addrs": []}
+                                       "web": f"https://{host}/", "host": host, "addrs": []}
             if not entry["uri"].startswith(scheme + ":"):
                 continue
             # The proto column is the network the announcement came over, not
@@ -393,6 +393,59 @@ def resolve_network() -> dict:
                 entry["addrs"].append(cand)
     for entry in found.values():
         entry["addrs"].sort(key=lambda a: a[0] != "v4")
+    scanners = resolve_scanners()
+    for entry in found.values():
+        if entry["host"] in scanners:
+            entry["scanner"] = scanners[entry["host"]]
+    return found
+
+
+def txt_value(txt: str, key: str) -> str:
+    m = re.search(rf'"{key}=([^"]{{0,128}})"', txt)
+    return m.group(1) if m else ""
+
+
+def resolve_scanners() -> dict:
+    """{host: scanner} for eSCL (AirScan) scanners, matched to printers by host.
+
+    A multifunction printer announces its scanner as _uscans._tcp (HTTPS) or
+    _uscan._tcp next to its _ipps._tcp printer, under the same host name.
+    """
+    found: dict = {}
+    for service, scheme in (("_uscans._tcp", "https"), ("_uscan._tcp", "http")):
+        out = run_capped([AVAHI_BROWSE, "-rpt", service], 8, MAX_AVAHI_OUTPUT)
+        if out is None:
+            continue
+        for line in out.splitlines()[:500]:
+            f = line.split(";")
+            if len(f) < 10 or f[0] != "=":
+                continue
+            host, addr, port, txt = f[6].rstrip("."), f[7], f[8], f[9]
+            if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host) or not port.isdigit():
+                continue
+            v4 = bool(IPV4_RE.match(addr))
+            have = found.get(host)
+            # HTTPS wins over HTTP; within one scheme, an IPv4 address wins.
+            if have and not (have["https"] < (scheme == "https")
+                             or (have["https"] == (scheme == "https") and v4 and not have["v4"])):
+                continue
+            rs = txt_value(txt, "rs") or "eSCL"
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", rs):
+                continue
+            # An IPv4 address avoids an mDNS lookup per request; otherwise the
+            # .local name, which nss-mdns resolves.
+            target = addr if v4 else host
+            sources = [s for s in txt_value(txt, "is").split(",") if s in ("platen", "adf")]
+            colors = [c for c in txt_value(txt, "cs").split(",") if c in ("color", "grayscale", "binary")]
+            formats = [x for x in txt_value(txt, "pdl").split(",") if x in ("application/pdf", "image/jpeg")]
+            found[host] = {
+                "url": f"{scheme}://{target}:{port}/{rs}",
+                "v4": v4,
+                "https": scheme == "https",
+                "sources": sources or ["platen"],
+                "colors": colors or ["color", "grayscale"],
+                "formats": formats or ["image/jpeg"],
+            }
     return found
 
 
@@ -441,6 +494,14 @@ def knock(targets: list) -> bool:
         except OSError:
             continue
     return False
+
+
+def scanner_of(device_uri: str, network: dict) -> dict | None:
+    """What the panel needs to offer scanning, if this printer has a scanner."""
+    sc = (network.get(device_key(device_uri)) or {}).get("scanner")
+    if not sc:
+        return None
+    return {"url": sc["url"], "sources": sc["sources"], "colors": sc["colors"], "formats": sc["formats"]}
 
 
 def direct_uri(device_uri: str, network: dict) -> tuple[str, str]:
@@ -717,10 +778,23 @@ class Monitor:
         printers_raw, jobs_raw, done_raw, default = self.cups
         network, offline, device = self.net.snapshot() if self.net else ({}, set(), {})
 
+        # CUPS adds a temporary queue for a network printer when an app prints
+        # to it directly (a browser's print dialog, say). When a saved queue
+        # already points at the same printer, fold the temporary one into it:
+        # it would only show up as a second, identical printer.
+        def same_device(p: dict) -> str:
+            uri = p.get("device-uri", "")
+            return device_key(uri) or uri
+        saved = {same_device(p): p.get("printer-name", "") for p in printers_raw
+                 if p.get("printer-is-temporary") != "true"}
+        alias: dict = {}
         printers = []
         for p in printers_raw:
             name = p.get("printer-name", "")
             if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,127}", name):
+                continue
+            if p.get("printer-is-temporary") == "true" and saved.get(same_device(p)):
+                alias[name] = saved[same_device(p)]
                 continue
             _, web = direct_uri(p.get("device-uri", ""), network)
             dev = device.get(name)
@@ -748,6 +822,7 @@ class Monitor:
                 "alert": alert,
                 "readingsAt": to_int((dev or {}).get("_at", 0), 0),
                 "web": web if re.fullmatch(r"https?://[A-Za-z0-9.-]+/", web or "") else "",
+                "scanner": scanner_of(p.get("device-uri", ""), network),
             })
 
         user = os.environ.get("USER", "")
@@ -759,6 +834,7 @@ class Monitor:
                 continue
             state = job_state(j.get("job-state")) or "pending"
             printer = j.get("job-printer-uri", "").rsplit("/", 1)[-1]
+            printer = alias.get(printer, printer)
             jname = j.get("job-name", "")
             current[jid] = (jname, printer, state)
             if len(jobs) < MAX_JOBS:

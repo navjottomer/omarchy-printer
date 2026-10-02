@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Scan one document from an eSCL (AirScan) scanner and save it.
+
+Started by the printer panel only when Scan is pressed; it exits when the
+scan is done, so nothing runs while you are not scanning. Python standard
+library only: eSCL is plain HTTP(S) with small XML bodies.
+
+    omarchy-printer-scan --url https://ADDR:PORT/eSCL [--source auto|platen|feeder]
+                         [--color color|gray|bw] [--dpi 300] [--format pdf|jpeg]
+                         [--size a4|letter|legal|max]
+                         [--name "Printer name"] [--no-notify]
+
+Progress goes to stdout as one JSON object per line:
+    {"state": "scanning", "page": 1}
+    {"state": "done", "files": ["/home/.../Scan 2026-10-02 11-15-03.pdf"], "dir": "..."}
+    {"state": "error", "message": "..."}
+
+A SIGTERM (the panel's Cancel) cancels the job on the scanner and removes the
+partly written file.
+
+The scanner's certificate is not checked: printers ship self-signed ones, and
+the address comes from the local network's own announcement, the same trust
+CUPS gives an IPPS printer it found that way.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import http.client
+import json
+import os
+import re
+import signal
+import ssl
+import subprocess
+import sys
+import time
+import urllib.parse
+
+MAX_XML = 256 << 10            # scanner status / capabilities replies
+MAX_DOCUMENT = 512 << 20       # one scanned document
+MAX_PAGES = 60                 # the feeder holds 50
+PAGE_TIMEOUT = 180             # seconds a single page may take to arrive
+BUSY_RETRIES = 30              # 503 "not ready yet" retries, one second apart
+
+NOTIFY_SEND = "/usr/bin/notify-send"
+PDFUNITE = "/usr/bin/pdfunite"     # poppler; optional
+
+URL_RE = re.compile(r"^(https?)://(\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})*)"
+                    r":(\d{1,5})(/[A-Za-z0-9/_-]{0,32})$")
+COLORS = {"color": "RGB24", "gray": "Grayscale8", "bw": "BlackAndWhite1"}
+FORMATS = {"pdf": ("application/pdf", "pdf"), "jpeg": ("image/jpeg", "jpg")}
+SOURCES = {"platen": "Platen", "feeder": "Feeder"}
+DPIS = (100, 200, 300, 600)
+# Scan regions in the scanner's 1/300 inch unit; it clips them to what the
+# glass or the sheet in the feeder allows.
+SIZES = {"a4": (2480, 3507), "letter": (2550, 3300), "legal": (2550, 4200), "max": (2550, 4200)}
+
+
+def say(**msg) -> None:
+    print(json.dumps(msg), flush=True)
+
+
+def fail(message: str, code: int = 1) -> None:
+    say(state="error", message=message)
+    sys.exit(code)
+
+
+class Scanner:
+    """A tiny HTTP(S) client for one eSCL scanner, every read bounded."""
+
+    def __init__(self, url: str):
+        m = URL_RE.match(url)
+        if not m:
+            fail("Bad scanner address")
+        self.scheme, self.host, self.port, self.root = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+        if not 0 < self.port < 65536:
+            fail("Bad scanner address")
+        self.ctx = None
+        if self.scheme == "https":
+            self.ctx = ssl.create_default_context()
+            self.ctx.check_hostname = False
+            self.ctx.verify_mode = ssl.CERT_NONE
+
+    def connect(self, timeout: float) -> http.client.HTTPConnection:
+        if self.ctx:
+            return http.client.HTTPSConnection(self.host, self.port, timeout=timeout, context=self.ctx)
+        return http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+
+    def request(self, method: str, path: str, body: bytes | None = None, timeout: float = 15,
+                headers: dict | None = None) -> tuple[int, dict, http.client.HTTPResponse, http.client.HTTPConnection]:
+        conn = self.connect(timeout)
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp, conn
+
+    def get_xml(self, name: str) -> str:
+        status, _, resp, conn = self.request("GET", f"{self.root}/{name}")
+        try:
+            data = resp.read(MAX_XML + 1)
+        finally:
+            conn.close()
+        if status != 200 or len(data) > MAX_XML:
+            raise OSError(f"{name}: HTTP {status}")
+        return data.decode("utf-8", "replace")
+
+    def job_path(self, location: str) -> str:
+        """The job's path on this scanner, from a Location header."""
+        # Some scanners answer with their .local name instead of the address
+        # we used, so only the path is taken; the host stays ours.
+        path = urllib.parse.urlsplit(location).path or location
+        if not re.fullmatch(r"/[A-Za-z0-9/_.-]{1,128}", path) or ".." in path:
+            raise OSError("odd job location")
+        return path.rstrip("/")
+
+
+def tag(xml: str, name: str) -> str:
+    m = re.search(rf"<(?:\w+:)?{name}>([^<]{{0,64}})</(?:\w+:)?{name}>", xml)
+    return m.group(1).strip() if m else ""
+
+
+def scan_settings(source: str, color: str, dpi: int, mime: str, size: tuple[int, int]) -> bytes:
+    # No scan:Intent: given one, Brother scanners apply the intent's own
+    # colour mode and ignore scan:ColorMode.
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+  <pwg:Version>2.0</pwg:Version>
+  <pwg:ScanRegions pwg:MustHonor="false">
+    <pwg:ScanRegion>
+      <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
+      <pwg:XOffset>0</pwg:XOffset>
+      <pwg:YOffset>0</pwg:YOffset>
+      <pwg:Width>{size[0]}</pwg:Width>
+      <pwg:Height>{size[1]}</pwg:Height>
+    </pwg:ScanRegion>
+  </pwg:ScanRegions>
+  <pwg:DocumentFormat>{mime}</pwg:DocumentFormat>
+  <scan:DocumentFormatExt>{mime}</scan:DocumentFormatExt>
+  <pwg:InputSource>{source}</pwg:InputSource>
+  <scan:XResolution>{dpi}</scan:XResolution>
+  <scan:YResolution>{dpi}</scan:YResolution>
+  <scan:ColorMode>{color}</scan:ColorMode>
+</scan:ScanSettings>
+"""
+    # No whitespace between elements: Brother's parser stops at the first
+    # text node between tags and then scans with its defaults instead.
+    return re.sub(r">\s+<", "><", xml.strip()).encode()
+
+
+def pictures_dir() -> str:
+    """XDG_PICTURES_DIR from user-dirs.dirs, else ~/Pictures."""
+    home = os.path.expanduser("~")
+    path = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "user-dirs.dirs")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f.read(16384).splitlines():
+                m = re.fullmatch(r'\s*XDG_PICTURES_DIR="([^"]{1,255})"\s*', line)
+                if m:
+                    p = m.group(1).replace("$HOME", home)
+                    if os.path.isabs(p) and ".." not in p.split("/"):
+                        return p
+    except OSError:
+        pass
+    return os.path.join(home, "Pictures")
+
+
+class Output:
+    """Files in <Pictures>/Scans, created without following symlinks."""
+
+    def __init__(self):
+        self.dir = os.path.join(pictures_dir(), "Scans")
+        os.makedirs(self.dir, mode=0o755, exist_ok=True)
+        # Open the folder itself without following a symlink, then create
+        # files relative to it, so nothing can redirect a write elsewhere.
+        self.dfd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.stamp = datetime.datetime.now().strftime("Scan %Y-%m-%d %H-%M-%S")
+        self.partial: str | None = None
+        self.files: list[str] = []
+
+    def create(self, page: int, ext: str) -> tuple[int, str]:
+        base = self.stamp if page == 1 else f"{self.stamp} (page {page})" if page else self.stamp
+        for n in range(0, 50):
+            name = f"{base}.{ext}" if n == 0 else f"{base}-{n}.{ext}"
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=self.dfd)
+            except FileExistsError:
+                continue
+            self.partial = name
+            return fd, name
+        raise OSError("could not pick a file name")
+
+    def done(self, name: str) -> None:
+        self.files.append(os.path.join(self.dir, name))
+        self.partial = None
+
+    def join_pdfs(self) -> None:
+        """Join a feeder stack sent as one PDF per page into a single PDF.
+
+        Scanners differ: some send the whole stack as one document, others
+        one document per page. Needs pdfunite (poppler); without it the pages
+        stay separate files.
+        """
+        if len(self.files) < 2 or not os.access(PDFUNITE, os.X_OK):
+            return
+        fd, name = self.create(0, "pdf")
+        os.close(fd)
+        joined = os.path.join(self.dir, name)
+        try:
+            ok = subprocess.run([PDFUNITE, *self.files, joined], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=120).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        if not ok:
+            self.discard()
+            return
+        for f in self.files:
+            try:
+                os.unlink(os.path.basename(f), dir_fd=self.dfd)
+            except OSError:
+                pass
+        self.partial = None
+        # Take the plain name back now that page 1's file is gone.
+        final = f"{self.stamp}.pdf"
+        try:
+            os.stat(final, dir_fd=self.dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                os.rename(name, final, src_dir_fd=self.dfd, dst_dir_fd=self.dfd)
+                joined = os.path.join(self.dir, final)
+            except OSError:
+                pass
+        self.files = [joined]
+
+    def discard(self) -> None:
+        if self.partial:
+            try:
+                os.unlink(self.partial, dir_fd=self.dfd)
+            except OSError:
+                pass
+            self.partial = None
+
+
+def notify(title: str, body: str) -> None:
+    try:
+        subprocess.Popen([NOTIFY_SEND, "-a", "Printer", "-i", "scanner", title, body],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--source", choices=["auto", "platen", "feeder"], default="auto")
+    ap.add_argument("--color", choices=list(COLORS), default="color")
+    ap.add_argument("--dpi", type=int, choices=DPIS, default=300)
+    ap.add_argument("--format", choices=list(FORMATS), default="pdf")
+    ap.add_argument("--size", choices=list(SIZES), default="a4")
+    ap.add_argument("--name", default="Scanner")
+    ap.add_argument("--no-notify", action="store_true")
+    try:
+        args = ap.parse_args()
+    except SystemExit:
+        fail("Bad arguments", 2)
+
+    color = COLORS[args.color]
+    mime, ext = FORMATS[args.format]
+    if args.color == "bw" and args.format == "jpeg":
+        color = COLORS["gray"]  # JPEG has no 1-bit mode
+    size = SIZES[args.size]
+    name = "".join(ch for ch in args.name if ch.isprintable())[:60] or "Scanner"
+
+    scanner = Scanner(args.url)
+    out: Output | None = None
+    job: str | None = None
+
+    def cancel(*_):
+        if job:
+            try:
+                _, _, resp, conn = scanner.request("DELETE", job, timeout=5)
+                resp.read(MAX_XML)
+                conn.close()
+            except (OSError, http.client.HTTPException):
+                pass
+        if out:
+            out.discard()
+        say(state="cancelled")
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, cancel)
+    signal.signal(signal.SIGINT, cancel)
+
+    try:
+        status = scanner.get_xml("ScannerStatus")
+    except (OSError, http.client.HTTPException):
+        fail("Scanner is not answering")
+    if tag(status, "State") not in ("Idle", ""):
+        fail("Scanner is busy")
+    loaded = tag(status, "AdfState") == "ScannerAdfLoaded"
+    source = SOURCES["feeder" if args.source == "auto" and loaded else
+                     "platen" if args.source == "auto" else args.source]
+    if source == "Feeder" and not loaded and tag(status, "AdfState"):
+        fail("The document feeder is empty")
+
+    try:
+        out = Output()
+    except OSError as e:
+        fail(f"Cannot write to Pictures/Scans: {e.strerror or e}")
+
+    say(state="starting", source="feeder" if source == "Feeder" else "glass")
+    try:
+        status_code, headers, resp, conn = scanner.request(
+            "POST", f"{scanner.root}/ScanJobs", scan_settings(source, color, args.dpi, mime, size),
+            headers={"Content-Type": "text/xml"})
+        resp.read(MAX_XML)
+        conn.close()
+        if status_code == 503:
+            fail("Scanner is busy")
+        if status_code not in (200, 201) or "location" not in headers:
+            fail(f"Scanner refused the scan (HTTP {status_code})")
+        job = scanner.job_path(headers["location"])
+    except (OSError, http.client.HTTPException):
+        fail("Scanner is not answering")
+
+    page = 0
+    busy = 0
+    while page < MAX_PAGES:
+        say(state="scanning", page=page + 1)
+        try:
+            code, _, resp, conn = scanner.request("GET", f"{job}/NextDocument", timeout=PAGE_TIMEOUT)
+        except (OSError, http.client.HTTPException):
+            if page:
+                break  # some scanners drop the connection after the last page
+            out.discard()
+            fail("Scanner stopped answering")
+        try:
+            if code == 503 and busy < BUSY_RETRIES:
+                resp.read(MAX_XML)
+                busy += 1
+                time.sleep(1)
+                continue
+            if code in (404, 410) or (code != 200 and page):
+                break  # no more pages
+            if code != 200:
+                fail(f"Scan failed (HTTP {code})")
+            fd, fname = out.create(page + 1, ext)
+            written = 0
+            with os.fdopen(fd, "wb") as f:
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_DOCUMENT:
+                        raise OSError("document too large")
+                    f.write(chunk)
+            if written == 0:
+                out.discard()
+                break
+            out.done(fname)
+            page += 1
+            busy = 0
+        except (OSError, http.client.HTTPException) as e:
+            out.discard()
+            fail(f"Scan failed: {e}")
+        finally:
+            conn.close()
+        # Keep asking even after a glass scan: the job only finishes on the
+        # scanner once it has answered "no more pages", and until then the
+        # scanner stays busy.
+
+    job = None
+    if not out.files:
+        fail("The scanner sent nothing")
+    if mime == "application/pdf":
+        out.join_pdfs()
+    say(state="done", files=out.files, dir=out.dir)
+    if not args.no_notify:
+        pages = f"{page} pages" if page > 1 else "1 page"
+        notify(f"Scanned {pages}", f"{name}\n{os.path.basename(out.files[0])} in {out.dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
