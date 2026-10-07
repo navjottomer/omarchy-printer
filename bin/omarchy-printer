@@ -410,8 +410,11 @@ def resolve_scanners() -> dict:
 
     A multifunction printer announces its scanner as _uscans._tcp (HTTPS) or
     _uscan._tcp next to its _ipps._tcp printer, under the same host name.
+    Both may be announced; HTTPS is the primary and the plain-HTTP endpoint
+    the fallback, because some scanners (e.g. Canon GX6000) advertise both
+    but only answer on one.
     """
-    found: dict = {}
+    seen: dict = {}
     for service, scheme in (("_uscans._tcp", "https"), ("_uscan._tcp", "http")):
         out = run_capped([AVAHI_BROWSE, "-rpt", service], 8, MAX_AVAHI_OUTPUT)
         if out is None:
@@ -423,29 +426,42 @@ def resolve_scanners() -> dict:
             host, addr, port, txt = f[6].rstrip("."), f[7], f[8], f[9]
             if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host) or not port.isdigit():
                 continue
-            v4 = bool(IPV4_RE.match(addr))
-            have = found.get(host)
-            # HTTPS wins over HTTP; within one scheme, an IPv4 address wins.
-            if have and not (have["https"] < (scheme == "https")
-                             or (have["https"] == (scheme == "https") and v4 and not have["v4"])):
-                continue
             rs = txt_value(txt, "rs") or "eSCL"
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", rs):
                 continue
+            v4 = bool(IPV4_RE.match(addr))
             # An IPv4 address avoids an mDNS lookup per request; otherwise the
             # .local name, which nss-mdns resolves.
-            target = addr if v4 else host
-            sources = [s for s in txt_value(txt, "is").split(",") if s in ("platen", "adf")]
-            colors = [c for c in txt_value(txt, "cs").split(",") if c in ("color", "grayscale", "binary")]
-            formats = [x for x in txt_value(txt, "pdl").split(",") if x in ("application/pdf", "image/jpeg")]
-            found[host] = {
-                "url": f"{scheme}://{target}:{port}/{rs}",
-                "v4": v4,
-                "https": scheme == "https",
-                "sources": sources or ["platen"],
-                "colors": colors or ["color", "grayscale"],
-                "formats": formats or ["image/jpeg"],
-            }
+            url = f"{scheme}://{addr if v4 else host}:{port}/{rs}"
+            have = seen.get(host)
+            if have is None:
+                have = seen[host] = {"https": None, "http": None, "https_v4": False,
+                                     "http_v4": False, "v4": False, "txt": txt}
+            # Within one scheme an IPv4 address wins.
+            if have[scheme] is None or (v4 and not have[scheme + "_v4"]):
+                have[scheme] = url
+                have[scheme + "_v4"] = v4
+                have["v4"] = have["v4"] or v4
+                have["txt"] = txt
+    found: dict = {}
+    for host, have in seen.items():
+        primary = have["https"] or have["http"]
+        if primary is None:
+            continue
+        fallback = have["http"] or have["https"]
+        txt = have["txt"]
+        sources = [s for s in txt_value(txt, "is").split(",") if s in ("platen", "adf")]
+        colors = [c for c in txt_value(txt, "cs").split(",") if c in ("color", "grayscale", "binary")]
+        formats = [x for x in txt_value(txt, "pdl").split(",") if x in ("application/pdf", "image/jpeg")]
+        found[host] = {
+            "url": primary,
+            "fallback": fallback if fallback != primary else None,
+            "v4": have["v4"],
+            "https": primary.startswith("https://"),
+            "sources": sources or ["platen"],
+            "colors": colors or ["color", "grayscale"],
+            "formats": formats or ["image/jpeg"],
+        }
     return found
 
 
@@ -501,7 +517,8 @@ def scanner_of(device_uri: str, network: dict) -> dict | None:
     sc = (network.get(device_key(device_uri)) or {}).get("scanner")
     if not sc:
         return None
-    return {"url": sc["url"], "sources": sc["sources"], "colors": sc["colors"], "formats": sc["formats"]}
+    return {"url": sc["url"], "fallback": sc.get("fallback"), "sources": sc["sources"],
+            "colors": sc["colors"], "formats": sc["formats"]}
 
 
 def direct_uri(device_uri: str, network: dict) -> tuple[str, str]:

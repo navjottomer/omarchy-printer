@@ -5,10 +5,10 @@ Started by the printer panel only when Scan is pressed; it exits when the
 scan is done, so nothing runs while you are not scanning. Python standard
 library only: eSCL is plain HTTP(S) with small XML bodies.
 
-    omarchy-printer-scan --url https://ADDR:PORT/eSCL [--source auto|platen|feeder]
-                         [--color color|gray|bw] [--dpi 300] [--format pdf|jpeg]
-                         [--size a4|letter|legal|max]
-                         [--name "Printer name"] [--no-notify]
+     omarchy-printer-scan --url https://ADDR:PORT/eSCL [--fallback-url http://ADDR:PORT/eSCL]
+                          [--source auto|platen|feeder] [--color color|gray|bw] [--dpi 300]
+                          [--format pdf|jpeg] [--size a4|letter|legal|max]
+                          [--name "Printer name"] [--no-notify]
 
 Progress goes to stdout as one JSON object per line:
     {"state": "scanning", "page": 1}
@@ -254,6 +254,7 @@ def notify(title: str, body: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--url", required=True)
+    ap.add_argument("--fallback-url", default="")
     ap.add_argument("--source", choices=["auto", "platen", "feeder"], default="auto")
     ap.add_argument("--color", choices=list(COLORS), default="color")
     ap.add_argument("--dpi", type=int, choices=DPIS, default=300)
@@ -296,7 +297,18 @@ def main() -> int:
     try:
         status = scanner.get_xml("ScannerStatus")
     except (OSError, http.client.HTTPException):
-        fail("Scanner is not answering")
+        # Some scanners (e.g. Canon GX6000) advertise both _uscans._tcp and
+        # _uscan._tcp but only serve eSCL on one of them; retry once on the
+        # other advertised endpoint.
+        if args.fallback_url and URL_RE.match(args.fallback_url):
+            try:
+                alt = Scanner(args.fallback_url)
+                status = alt.get_xml("ScannerStatus")
+                scanner = alt
+            except (OSError, http.client.HTTPException):
+                fail("Scanner is not answering")
+        else:
+            fail("Scanner is not answering")
     if tag(status, "State") not in ("Idle", ""):
         fail("Scanner is busy")
     loaded = tag(status, "AdfState") == "ScannerAdfLoaded"
