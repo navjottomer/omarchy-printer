@@ -255,10 +255,13 @@ Panel {
     scanError = ""
     scanStep = "Starting…"
     var color = scanColor === "bw" && scanFormat !== "pdf" ? "gray" : scanColor
-    scanProc.command = [pluginDir + "bin/omarchy-printer-scan",
+    var cmd = [pluginDir + "bin/omarchy-printer-scan",
       "--url", scanner.url, "--source", scanSource, "--color", color, "--dpi", scanDpi,
       "--size", scanSize, "--format", scanFormat, "--name", printer.info]
       .concat(notifications ? [] : ["--no-notify"])
+    if (scanner.fallback)
+      cmd.push("--fallback-url", scanner.fallback)
+    scanProc.command = cmd
     scanProc.running = true
   }
 
