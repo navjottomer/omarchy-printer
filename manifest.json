@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "navjottomer.printer",
   "name": "Printer",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "navjottomer",
   "license": "MIT",
   "description": "Printer status, toner levels, the print queue and scanning in the Omarchy bar, using only CUPS, Avahi and eSCL",

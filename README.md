@@ -203,7 +203,11 @@ the HTTP-and-XML scan protocol behind AirScan and Mopria Scan:
    host name — and tells the panel which sources, colours and formats it has;
 2. the helper checks the scanner is idle (and whether paper is in the
    feeder, for **Auto**), sends the scan settings, and saves each document
-   the scanner returns until it reports there are no more pages;
+   the scanner returns until it reports there are no more pages. Some
+   scanners (a Canon GX6000, for one) announce both HTTPS and plain HTTP but
+   only answer on one, so the helper tries HTTPS first and retries once on the
+   other announced address. Over plain HTTP a scan crosses your local network
+   unencrypted, as it does for that scanner's own apps;
 3. files are created in `~/Pictures/Scans` with `O_EXCL | O_NOFOLLOW`
    relative to the folder opened without following symlinks, so a scan can
    never overwrite or be redirected onto another file. Each document is
