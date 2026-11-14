@@ -507,634 +507,654 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    focusTarget: contentLoader.item
     contentWidth: panel.fittedContentWidth(Style.space(360))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+    contentHeight: panel.fittedContentHeight(contentLoader.item ? contentLoader.item.implicitHeight : 0)
 
-    PanelKeyCatcher {
-      id: keyCatcher
+    // The panel's contents are built the first time it opens and kept after
+    // that, instead of on every monitor at shell start. Built eagerly, the
+    // whole tree re-evaluated its bindings on every theme change even while
+    // the panel was closed. A Loader rather than KeyboardPanel's `content`
+    // (Omarchy 4.5+) keeps this working on 4.0.x.
+    Loader {
+      id: contentLoader
+      property bool built: false
       anchors.fill: parent
-      onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.switchPanel(direction) }
-      onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
-      onActivateRequested: if (root.cursorItem !== "") root.activate(root.cursorItem)
-      onDeleteRequested: if (root.cursorItem.indexOf("job:") === 0) root.activate(root.cursorItem)
-      onTextKey: function(t) { if (t === "r" || t === "R") root.refresh() }
+      focus: true
+      active: built || panel.open
+      onLoaded: {
+        built = true
+        // On the first open the panel may have asked for focus before the
+        // contents existed.
+        if (panel.open) Qt.callLater(function() { if (panel.open && contentLoader.item) contentLoader.item.forceActiveFocus() })
+      }
 
-      Column {
-        id: column
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        spacing: Style.space(14)
+      sourceComponent: PanelKeyCatcher {
+        id: keyCatcher
+        anchors.fill: parent
+        implicitHeight: column.implicitHeight
+        onCloseRequested: root.close()
+        onTabRequested: function(direction) { root.switchPanel(direction) }
+        onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
+        onActivateRequested: if (root.cursorItem !== "") root.activate(root.cursorItem)
+        onDeleteRequested: if (root.cursorItem.indexOf("job:") === 0) root.activate(root.cursorItem)
+        onTextKey: function(t) { if (t === "r" || t === "R") root.refresh() }
 
-        // ---------- No printer / CUPS down ----------
-        Text {
-          visible: !root.printer
-          width: parent.width
-          wrapMode: Text.WordWrap
-          textFormat: Text.PlainText
-          text: root.status.ok === false && root.status.error ? root.status.error : "No printers set up"
-          color: root.dimForeground
-          font.family: root.ff
-          font.pixelSize: Style.font.bodySmall
-        }
-
-        // ---------- Printer list (more than one printer) ----------
-        // One full-width row per printer with its status; the chosen one is
-        // highlighted. Printers sharing a name are told apart by queue name.
         Column {
-          visible: root.printers.length > 1
-          width: parent.width
-          spacing: Style.space(4)
-
-          PanelSectionHeader {
-            text: "PRINTERS"
-            foreground: root.barForeground
-            fontFamily: root.ff
-          }
-
-          Repeater {
-            model: root.printers.length
-            Button {
-              required property int index
-              readonly property var p: root.printers[index] || ({})
-              readonly property bool twin: root.printers.some(function(o, i) { return i !== index && o.info === p.info })
-              width: parent.width
-              leftAlign: true
-              iconText: p.status === "Offline" ? "\u{f0e5d}" : p.status === "Paused" ? "\u{f1786}" : "\u{f042a}"
-              iconSize: Style.font.icon
-              text: (p.info || "") + (twin ? " (" + p.name + ")" : "") + "  ·  " + (p.status || "")
-              fontSize: Style.font.bodySmall
-              fontFamily: root.ff
-              foreground: root.barForeground
-              selected: !!root.printer && p.name === root.printer.name
-              hasCursor: root.hasCursor("pick:" + index)
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY
-              onClicked: root.chosenName = p.name
-            }
-          }
-        }
-
-        // ---------- Tabs (only for a printer with a scanner) ----------
-        Row {
-          visible: root.canScan
-          width: parent.width
-          spacing: Style.space(6)
-
-          Repeater {
-            model: [{ key: "printer", label: "Printer", icon: "\u{f042a}" }, { key: "scan", label: "Scan", icon: "\u{f06ab}" }]
-            Button {
-              required property var modelData
-              width: (parent.width - parent.spacing) / 2
-              iconText: modelData.icon
-              iconSize: Style.font.icon
-              text: modelData.label
-              selected: root.tab === modelData.key
-              hasCursor: root.hasCursor("tabs") && root.tab === modelData.key
-              fontSize: Style.font.bodySmall
-              foreground: root.barForeground
-              fontFamily: root.ff
-              bordered: true
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY
-              onClicked: root.tab = modelData.key
-            }
-          }
-        }
-
-        // ---------- Printer tab ----------
-        Column {
-          visible: root.tab === "printer" || !root.canScan
-          width: parent.width
+          id: column
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.top: parent.top
           spacing: Style.space(14)
 
-          // ---------- Header: name, status, paper ----------
-          Item {
-            visible: !!root.printer
+          // ---------- No printer / CUPS down ----------
+          Text {
+            visible: !root.printer
             width: parent.width
-            implicitHeight: Math.max(headLeft.implicitHeight, headRight.implicitHeight)
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: root.status.ok === false && root.status.error ? root.status.error : "No printers set up"
+            color: root.dimForeground
+            font.family: root.ff
+            font.pixelSize: Style.font.bodySmall
+          }
 
-            Column {
-              id: headLeft
-              anchors.left: parent.left
-              anchors.right: headRight.left
-              anchors.rightMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
+          // ---------- Printer list (more than one printer) ----------
+          // One full-width row per printer with its status; the chosen one is
+          // highlighted. Printers sharing a name are told apart by queue name.
+          Column {
+            visible: root.printers.length > 1
+            width: parent.width
+            spacing: Style.space(4)
 
-              Text {
+            PanelSectionHeader {
+              text: "PRINTERS"
+              foreground: root.barForeground
+              fontFamily: root.ff
+            }
+
+            Repeater {
+              model: root.printers.length
+              Button {
+                required property int index
+                readonly property var p: root.printers[index] || ({})
+                readonly property bool twin: root.printers.some(function(o, i) { return i !== index && o.info === p.info })
                 width: parent.width
-                elide: Text.ElideRight
-                textFormat: Text.PlainText
-                text: root.printer ? root.printer.info : ""
-                color: root.barForeground
-                font.family: root.ff
-                font.pixelSize: Style.font.subtitle
+                leftAlign: true
+                iconText: p.status === "Offline" ? "\u{f0e5d}" : p.status === "Paused" ? "\u{f1786}" : "\u{f042a}"
+                iconSize: Style.font.icon
+                text: (p.info || "") + (twin ? " (" + p.name + ")" : "") + "  ·  " + (p.status || "")
+                fontSize: Style.font.bodySmall
+                fontFamily: root.ff
+                foreground: root.barForeground
+                selected: !!root.printer && p.name === root.printer.name
+                hasCursor: root.hasCursor("pick:" + index)
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.controlPaddingY
+                onClicked: root.chosenName = p.name
+              }
+            }
+          }
+
+          // ---------- Tabs (only for a printer with a scanner) ----------
+          Row {
+            visible: root.canScan
+            width: parent.width
+            spacing: Style.space(6)
+
+            Repeater {
+              model: [{ key: "printer", label: "Printer", icon: "\u{f042a}" }, { key: "scan", label: "Scan", icon: "\u{f06ab}" }]
+              Button {
+                required property var modelData
+                width: (parent.width - parent.spacing) / 2
+                iconText: modelData.icon
+                iconSize: Style.font.icon
+                text: modelData.label
+                selected: root.tab === modelData.key
+                hasCursor: root.hasCursor("tabs") && root.tab === modelData.key
+                fontSize: Style.font.bodySmall
+                foreground: root.barForeground
+                fontFamily: root.ff
+                bordered: true
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.controlPaddingY
+                onClicked: root.tab = modelData.key
+              }
+            }
+          }
+
+          // ---------- Printer tab ----------
+          Column {
+            visible: root.tab === "printer" || !root.canScan
+            width: parent.width
+            spacing: Style.space(14)
+
+            // ---------- Header: name, status, paper ----------
+            Item {
+              visible: !!root.printer
+              width: parent.width
+              implicitHeight: Math.max(headLeft.implicitHeight, headRight.implicitHeight)
+
+              Column {
+                id: headLeft
+                anchors.left: parent.left
+                anchors.right: headRight.left
+                anchors.rightMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  width: parent.width
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  text: root.printer ? root.printer.info : ""
+                  color: root.barForeground
+                  font.family: root.ff
+                  font.pixelSize: Style.font.subtitle
+                }
+
+                Text {
+                  width: parent.width
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  text: !root.printer ? ""
+                    : root.hasProblem ? root.printer.problems.filter(function(p) { return p.indexOf("toner low") < 0 }).join(" · ")
+                    : root.printer.status + (root.printer.message && root.printer.message !== root.printer.status
+                      ? " · " + root.printer.message : "")
+                  color: root.hasProblem ? root.urgent : root.dimForeground
+                  font.family: root.ff
+                  font.pixelSize: Style.font.caption
+                }
               }
 
-              Text {
-                width: parent.width
-                elide: Text.ElideRight
-                textFormat: Text.PlainText
-                text: !root.printer ? ""
-                  : root.hasProblem ? root.printer.problems.filter(function(p) { return p.indexOf("toner low") < 0 }).join(" · ")
-                  : root.printer.status + (root.printer.message && root.printer.message !== root.printer.status
-                    ? " · " + root.printer.message : "")
-                color: root.hasProblem ? root.urgent : root.dimForeground
-                font.family: root.ff
-                font.pixelSize: Style.font.caption
+              Column {
+                id: headRight
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  anchors.right: parent.right
+                  visible: !!root.printer && root.printer.media !== ""
+                  textFormat: Text.PlainText
+                  text: "\u{f0219}  " + (root.printer ? root.printer.media : "") // nf-md-file
+                  color: root.barForeground
+                  font.family: root.ff
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Text {
+                  anchors.right: parent.right
+                  visible: !!root.printer && root.printer.name === root.status["default"]
+                  textFormat: Text.PlainText
+                  text: "Default"
+                  color: root.dimForeground
+                  font.family: root.ff
+                  font.pixelSize: Style.font.caption
+                }
               }
             }
 
+            PanelSeparator { visible: !!root.printer && root.printer.markers.length > 0; foreground: root.barForeground }
+
+            // ---------- Toner ----------
             Column {
-              id: headRight
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
+              visible: !!root.printer && root.printer.markers.length > 0
+              width: parent.width
+              spacing: Style.space(8)
+
+              Item {
+                width: parent.width
+                implicitHeight: tonerTitle.implicitHeight
+
+                PanelSectionHeader {
+                  id: tonerTitle
+                  text: "TONER"
+                  foreground: root.barForeground
+                  fontFamily: root.ff
+                }
+
+                Text {
+                  anchors.right: parent.right
+                  anchors.verticalCenter: tonerTitle.verticalCenter
+                  visible: !!root.printer && root.printer.readingsAt > 0
+                  textFormat: Text.PlainText
+                  text: root.printer ? root.timeAgo(root.printer.readingsAt) : ""
+                  color: root.dimForeground
+                  font.family: root.ff
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Repeater {
+                model: root.printer ? root.printer.markers.length : 0
+
+                Item {
+                  required property int index
+                  readonly property var m: root.printer ? root.printer.markers[index] || ({}) : ({})
+                  readonly property bool low: m.level >= 0 && m.level <= m.low
+                  readonly property bool known: m.level >= 0
+
+                  width: parent.width
+                  implicitHeight: Math.max(tonerName.implicitHeight, tonerPct.implicitHeight)
+
+                  Text {
+                    id: tonerName
+                    // Long names (Canon: "Canon Cartridge 075 Black Toner") get up to
+                    // 45% of the row and are cut with "…" instead of running under the bar.
+                    width: Math.max(Style.space(64), Math.round(parent.width * 0.45))
+                    elide: Text.ElideRight
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    textFormat: Text.PlainText
+                    text: m.name || ""
+                    color: root.dimForeground
+                    font.family: root.ff
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Item {
+                    anchors.left: tonerName.right
+                    anchors.right: tonerPct.left
+                    anchors.rightMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: Style.space(6)
+
+                    Rectangle {
+                      anchors.fill: parent
+                      radius: Style.space(2)
+                      color: root.barForeground
+                      opacity: 0.06
+                    }
+
+                    Rectangle {
+                      height: parent.height
+                      radius: Style.space(2)
+                      width: parent.width * Math.max(0, Math.min(100, Number(m.level) || 0)) / 100
+                      // The printer's own colour for each toner, or the theme accent.
+                      // Black toner would vanish on a dark bar, so very dark
+                      // colours use the theme's text colour instead.
+                      color: low ? root.urgent
+                        : (root.realTonerColors && m.color ? root.visibleTonerColor(m.color) : Color.accent)
+                      opacity: 0.85
+                    }
+                  }
+
+                  Text {
+                    id: tonerPct
+                    width: Style.space(36)
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    horizontalAlignment: Text.AlignRight
+                    textFormat: Text.PlainText
+                    text: known ? m.level + "%" : "—"
+                    color: low ? root.urgent : root.barForeground
+                    font.family: root.ff
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                }
+              }
+            }
+
+            PanelSeparator { visible: !!root.printer; foreground: root.barForeground }
+
+            // ---------- Queue ----------
+            Column {
+              visible: !!root.printer
+              width: parent.width
+              spacing: Style.space(6)
+
+              Item {
+                width: parent.width
+                implicitHeight: queueTitle.implicitHeight
+
+                PanelSectionHeader {
+                  id: queueTitle
+                  text: "QUEUE"
+                  foreground: root.barForeground
+                  fontFamily: root.ff
+                }
+
+                PanelSectionHeader {
+                  anchors.right: parent.right
+                  visible: root.jobs.length > 0
+                  text: String(root.jobs.length)
+                  foreground: root.barForeground
+                  fontFamily: root.ff
+                }
+              }
 
               Text {
-                anchors.right: parent.right
-                visible: !!root.printer && root.printer.media !== ""
+                visible: root.jobs.length === 0
                 textFormat: Text.PlainText
-                text: "\u{f0219}  " + (root.printer ? root.printer.media : "") // nf-md-file
-                color: root.barForeground
+                text: "Nothing waiting"
+                color: root.dimForeground
                 font.family: root.ff
                 font.pixelSize: Style.font.bodySmall
               }
 
-              Text {
-                anchors.right: parent.right
-                visible: !!root.printer && root.printer.name === root.status["default"]
-                textFormat: Text.PlainText
-                text: "Default"
-                color: root.dimForeground
-                font.family: root.ff
-                font.pixelSize: Style.font.caption
-              }
-            }
-          }
-
-          PanelSeparator { visible: !!root.printer && root.printer.markers.length > 0; foreground: root.barForeground }
-
-          // ---------- Toner ----------
-          Column {
-            visible: !!root.printer && root.printer.markers.length > 0
-            width: parent.width
-            spacing: Style.space(8)
-
-            Item {
-              width: parent.width
-              implicitHeight: tonerTitle.implicitHeight
-
-              PanelSectionHeader {
-                id: tonerTitle
-                text: "TONER"
-                foreground: root.barForeground
-                fontFamily: root.ff
-              }
-
-              Text {
-                anchors.right: parent.right
-                anchors.verticalCenter: tonerTitle.verticalCenter
-                visible: !!root.printer && root.printer.readingsAt > 0
-                textFormat: Text.PlainText
-                text: root.printer ? root.timeAgo(root.printer.readingsAt) : ""
-                color: root.dimForeground
-                font.family: root.ff
-                font.pixelSize: Style.font.caption
-              }
-            }
-
-            Repeater {
-              model: root.printer ? root.printer.markers.length : 0
-
-              Item {
-                required property int index
-                readonly property var m: root.printer ? root.printer.markers[index] || ({}) : ({})
-                readonly property bool low: m.level >= 0 && m.level <= m.low
-                readonly property bool known: m.level >= 0
-
-                width: parent.width
-                implicitHeight: Math.max(tonerName.implicitHeight, tonerPct.implicitHeight)
-
-                Text {
-                  id: tonerName
-                  // Long names (Canon: "Canon Cartridge 075 Black Toner") get up to
-                  // 45% of the row and are cut with "…" instead of running under the bar.
-                  width: Math.max(Style.space(64), Math.round(parent.width * 0.45))
-                  elide: Text.ElideRight
-                  anchors.left: parent.left
-                  anchors.verticalCenter: parent.verticalCenter
-                  textFormat: Text.PlainText
-                  text: m.name || ""
-                  color: root.dimForeground
-                  font.family: root.ff
-                  font.pixelSize: Style.font.bodySmall
-                }
+              Repeater {
+                model: root.jobs.length
 
                 Item {
-                  anchors.left: tonerName.right
-                  anchors.right: tonerPct.left
-                  anchors.rightMargin: Style.space(10)
-                  anchors.verticalCenter: parent.verticalCenter
-                  height: Style.space(6)
+                  required property int index
+                  readonly property var j: root.jobs[index] || ({})
+                  width: parent.width
+                  implicitHeight: Math.max(jobRow.implicitHeight, cancelButton.implicitHeight)
 
-                  Rectangle {
-                    anchors.fill: parent
-                    radius: Style.space(2)
-                    color: root.barForeground
-                    opacity: 0.06
+                  InfoRow {
+                    id: jobRow
+                    anchors.left: parent.left
+                    anchors.right: cancelButton.left
+                    anchors.rightMargin: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    icon: j.state === "printing" ? "\u{f042a}" : "\u{f0150}" // printer / clock
+                    key: j.mine ? j.name : "Another user's job"
+                    value: root.jobState(j)
+                    valueColor: j.state === "printing" ? root.barForeground : root.dimForeground
                   }
 
-                  Rectangle {
-                    height: parent.height
-                    radius: Style.space(2)
-                    width: parent.width * Math.max(0, Math.min(100, Number(m.level) || 0)) / 100
-                    // The printer's own colour for each toner, or the theme accent.
-                    // Black toner would vanish on a dark bar, so very dark
-                    // colours use the theme's text colour instead.
-                    color: low ? root.urgent
-                      : (root.realTonerColors && m.color ? root.visibleTonerColor(m.color) : Color.accent)
-                    opacity: 0.85
+                  PanelActionButton {
+                    id: cancelButton
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: j.mine === true
+                    iconText: "\u{f0156}" // nf-md-close
+                    hasCursor: root.hasCursor("job:" + j.id)
+                    tooltipText: "Cancel"
+                    foreground: root.barForeground
+                    hoverColor: root.urgent
+                    fontFamily: root.ff
+                    fontSize: Style.font.bodySmall
+                    onClicked: root.cancelJob(j.id)
                   }
+                }
+              }
+
+              Button {
+                visible: root.myJobs.length > 1
+                width: parent.width
+                text: "Cancel all my jobs"
+                hasCursor: root.hasCursor("cancelAll")
+                fontSize: Style.font.bodySmall
+                foreground: root.barForeground
+                fontFamily: root.ff
+                bordered: true
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.controlPaddingY
+                onClicked: root.cancelMine()
+              }
+            }
+
+            PanelSeparator { visible: !!root.printer; foreground: root.barForeground }
+
+            // ---------- Actions ----------
+            Grid {
+              visible: !!root.printer
+              width: parent.width
+              columns: 2
+              columnSpacing: Style.space(6)
+              rowSpacing: Style.space(6)
+
+              readonly property real cellWidth: (width - columnSpacing) / 2
+
+              Button {
+                width: parent.cellWidth
+                iconText: root.paused ? "\u{f040a}" : "\u{f03e4}" // play / pause
+                iconSize: Style.font.icon
+                text: root.paused ? "Resume" : "Pause"
+                hasCursor: root.hasCursor("pause")
+                tooltipText: "Needs your password"
+                fontSize: Style.font.bodySmall
+                foreground: root.barForeground
+                fontFamily: root.ff
+                bordered: true
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                onClicked: root.togglePause()
+              }
+
+              Button {
+                width: parent.cellWidth
+                iconText: "\u{f0219}" // nf-md-file
+                iconSize: Style.font.icon
+                text: root.testArmed ? "Again to print" : "Test page"
+                hasCursor: root.hasCursor("test")
+                fontSize: Style.font.bodySmall
+                foreground: root.testArmed ? root.urgent : root.barForeground
+                fontFamily: root.ff
+                bordered: true
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                onClicked: root.printTestPage()
+              }
+
+              Button {
+                width: parent.cellWidth
+                enabled: !!root.printer && root.printer.web !== ""
+                iconText: "\u{f059f}" // nf-md-web
+                iconSize: Style.font.icon
+                text: "Web page"
+                hasCursor: root.hasCursor("web")
+                fontSize: Style.font.bodySmall
+                foreground: root.barForeground
+                fontFamily: root.ff
+                bordered: true
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                onClicked: root.openWeb()
+              }
+
+              Button {
+                width: parent.cellWidth
+                iconText: "\u{f0493}" // nf-md-cog
+                iconSize: Style.font.icon
+                text: "Settings"
+                hasCursor: root.hasCursor("settings")
+                fontSize: Style.font.bodySmall
+                foreground: root.barForeground
+                fontFamily: root.ff
+                bordered: true
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                onClicked: root.openSettings()
+              }
+            }
+          }
+
+          // ---------- Scan tab ----------
+          Column {
+            visible: root.tab === "scan" && root.canScan
+            width: parent.width
+            spacing: Style.space(12)
+
+            Item {
+              width: parent.width
+              implicitHeight: scanHead.implicitHeight
+
+              Column {
+                id: scanHead
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: Style.space(2)
+
+                Text {
+                  width: parent.width
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  text: root.printer ? root.printer.info : ""
+                  color: root.barForeground
+                  font.family: root.ff
+                  font.pixelSize: Style.font.subtitle
                 }
 
                 Text {
-                  id: tonerPct
-                  width: Style.space(36)
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  horizontalAlignment: Text.AlignRight
+                  width: parent.width
+                  elide: Text.ElideRight
                   textFormat: Text.PlainText
-                  text: known ? m.level + "%" : "—"
-                  color: low ? root.urgent : root.barForeground
+                  text: root.scanning ? root.scanStep
+                    : root.scanError !== "" ? root.scanError
+                    : root.offline ? "Offline"
+                    : root.scanSource === "auto" ? "Auto uses the feeder when paper is in it"
+                    : "Ready"
+                  color: root.scanError !== "" && !root.scanning ? root.urgent : root.dimForeground
                   font.family: root.ff
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: Style.font.caption
                 }
               }
             }
-          }
 
-          PanelSeparator { visible: !!root.printer; foreground: root.barForeground }
+            PanelSeparator { foreground: root.barForeground }
 
-          // ---------- Queue ----------
-          Column {
-            visible: !!root.printer
-            width: parent.width
-            spacing: Style.space(6)
+            OptionRow {
+              label: "Source"
+              options: root.sourceOptions
+              value: root.scanSource
+              hasCursor: root.hasCursor("scan:source")
+              onPicked: function(v) { root.saveSetting("scanSource", v) }
+            }
+
+            OptionRow {
+              label: "Colour"
+              options: root.colorOptions
+              value: root.scanColor === "bw" && root.scanFormat !== "pdf" ? "gray" : root.scanColor
+              hasCursor: root.hasCursor("scan:color")
+              onPicked: function(v) { root.saveSetting("scanColor", v) }
+            }
+
+            OptionRow {
+              label: "Quality (dpi)"
+              options: root.dpiOptions
+              value: root.scanDpi
+              hasCursor: root.hasCursor("scan:dpi")
+              onPicked: function(v) { root.saveSetting("scanDpi", v) }
+            }
+
+            OptionRow {
+              label: "Page size"
+              options: root.sizeOptions
+              value: root.scanSize
+              hasCursor: root.hasCursor("scan:size")
+              onPicked: function(v) { root.saveSetting("scanSize", v) }
+            }
+
+            OptionRow {
+              label: "Format"
+              options: root.formatOptions
+              value: root.scanFormat
+              hasCursor: root.hasCursor("scan:format")
+              onPicked: function(v) { root.saveSetting("scanFormat", v) }
+            }
 
             Item {
               width: parent.width
-              implicitHeight: queueTitle.implicitHeight
+              implicitHeight: Math.max(openLabel.implicitHeight, openSwitch.implicitHeight)
 
-              PanelSectionHeader {
-                id: queueTitle
-                text: "QUEUE"
-                foreground: root.barForeground
-                fontFamily: root.ff
+              Text {
+                id: openLabel
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "Open the file after scanning"
+                color: root.dimForeground
+                font.family: root.ff
+                font.pixelSize: Style.font.bodySmall
               }
 
-              PanelSectionHeader {
+              ToggleSwitch {
+                id: openSwitch
                 anchors.right: parent.right
-                visible: root.jobs.length > 0
-                text: String(root.jobs.length)
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.scanOpen
                 foreground: root.barForeground
-                fontFamily: root.ff
-              }
-            }
-
-            Text {
-              visible: root.jobs.length === 0
-              textFormat: Text.PlainText
-              text: "Nothing waiting"
-              color: root.dimForeground
-              font.family: root.ff
-              font.pixelSize: Style.font.bodySmall
-            }
-
-            Repeater {
-              model: root.jobs.length
-
-              Item {
-                required property int index
-                readonly property var j: root.jobs[index] || ({})
-                width: parent.width
-                implicitHeight: Math.max(jobRow.implicitHeight, cancelButton.implicitHeight)
-
-                InfoRow {
-                  id: jobRow
-                  anchors.left: parent.left
-                  anchors.right: cancelButton.left
-                  anchors.rightMargin: Style.space(6)
-                  anchors.verticalCenter: parent.verticalCenter
-                  icon: j.state === "printing" ? "\u{f042a}" : "\u{f0150}" // printer / clock
-                  key: j.mine ? j.name : "Another user's job"
-                  value: root.jobState(j)
-                  valueColor: j.state === "printing" ? root.barForeground : root.dimForeground
-                }
-
-                PanelActionButton {
-                  id: cancelButton
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  visible: j.mine === true
-                  iconText: "\u{f0156}" // nf-md-close
-                  hasCursor: root.hasCursor("job:" + j.id)
-                  tooltipText: "Cancel"
-                  foreground: root.barForeground
-                  hoverColor: root.urgent
-                  fontFamily: root.ff
-                  fontSize: Style.font.bodySmall
-                  onClicked: root.cancelJob(j.id)
-                }
+                hasCursor: root.hasCursor("scan:open")
+                onToggled: root.saveSetting("scanOpen", !root.scanOpen)
               }
             }
 
             Button {
-              visible: root.myJobs.length > 1
               width: parent.width
-              text: "Cancel all my jobs"
-              hasCursor: root.hasCursor("cancelAll")
-              fontSize: Style.font.bodySmall
-              foreground: root.barForeground
-              fontFamily: root.ff
-              bordered: true
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY
-              onClicked: root.cancelMine()
-            }
-          }
-
-          PanelSeparator { visible: !!root.printer; foreground: root.barForeground }
-
-          // ---------- Actions ----------
-          Grid {
-            visible: !!root.printer
-            width: parent.width
-            columns: 2
-            columnSpacing: Style.space(6)
-            rowSpacing: Style.space(6)
-
-            readonly property real cellWidth: (width - columnSpacing) / 2
-
-            Button {
-              width: parent.cellWidth
-              iconText: root.paused ? "\u{f040a}" : "\u{f03e4}" // play / pause
+              enabled: root.scanning || !root.offline
+              iconText: root.scanning ? "\u{f0156}" : "\u{f06ab}" // close / scanner
               iconSize: Style.font.icon
-              text: root.paused ? "Resume" : "Pause"
-              hasCursor: root.hasCursor("pause")
-              tooltipText: "Needs your password"
+              text: root.scanning ? "Cancel scan" : "Scan"
+              hasCursor: root.hasCursor("scan:go")
               fontSize: Style.font.bodySmall
-              foreground: root.barForeground
+              foreground: root.scanning ? root.urgent : root.barForeground
               fontFamily: root.ff
               bordered: true
               horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-              onClicked: root.togglePause()
+              verticalPadding: Style.spacing.controlPaddingY + Style.space(4)
+              onClicked: root.scanning ? root.cancelScan() : root.startScan()
             }
 
-            Button {
-              width: parent.cellWidth
-              iconText: "\u{f0219}" // nf-md-file
-              iconSize: Style.font.icon
-              text: root.testArmed ? "Again to print" : "Test page"
-              hasCursor: root.hasCursor("test")
-              fontSize: Style.font.bodySmall
-              foreground: root.testArmed ? root.urgent : root.barForeground
-              fontFamily: root.ff
-              bordered: true
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-              onClicked: root.printTestPage()
-            }
+            PanelSeparator { visible: root.lastScan.length > 0; foreground: root.barForeground }
 
-            Button {
-              width: parent.cellWidth
-              enabled: !!root.printer && root.printer.web !== ""
-              iconText: "\u{f059f}" // nf-md-web
-              iconSize: Style.font.icon
-              text: "Web page"
-              hasCursor: root.hasCursor("web")
-              fontSize: Style.font.bodySmall
-              foreground: root.barForeground
-              fontFamily: root.ff
-              bordered: true
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-              onClicked: root.openWeb()
-            }
-
-            Button {
-              width: parent.cellWidth
-              iconText: "\u{f0493}" // nf-md-cog
-              iconSize: Style.font.icon
-              text: "Settings"
-              hasCursor: root.hasCursor("settings")
-              fontSize: Style.font.bodySmall
-              foreground: root.barForeground
-              fontFamily: root.ff
-              bordered: true
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-              onClicked: root.openSettings()
-            }
-          }
-        }
-
-        // ---------- Scan tab ----------
-        Column {
-          visible: root.tab === "scan" && root.canScan
-          width: parent.width
-          spacing: Style.space(12)
-
-          Item {
-            width: parent.width
-            implicitHeight: scanHead.implicitHeight
-
+            // ---------- Last scan ----------
             Column {
-              id: scanHead
-              anchors.left: parent.left
-              anchors.right: parent.right
-              spacing: Style.space(2)
-
-              Text {
-                width: parent.width
-                elide: Text.ElideRight
-                textFormat: Text.PlainText
-                text: root.printer ? root.printer.info : ""
-                color: root.barForeground
-                font.family: root.ff
-                font.pixelSize: Style.font.subtitle
-              }
-
-              Text {
-                width: parent.width
-                elide: Text.ElideRight
-                textFormat: Text.PlainText
-                text: root.scanning ? root.scanStep
-                  : root.scanError !== "" ? root.scanError
-                  : root.offline ? "Offline"
-                  : root.scanSource === "auto" ? "Auto uses the feeder when paper is in it"
-                  : "Ready"
-                color: root.scanError !== "" && !root.scanning ? root.urgent : root.dimForeground
-                font.family: root.ff
-                font.pixelSize: Style.font.caption
-              }
-            }
-          }
-
-          PanelSeparator { foreground: root.barForeground }
-
-          OptionRow {
-            label: "Source"
-            options: root.sourceOptions
-            value: root.scanSource
-            hasCursor: root.hasCursor("scan:source")
-            onPicked: function(v) { root.saveSetting("scanSource", v) }
-          }
-
-          OptionRow {
-            label: "Colour"
-            options: root.colorOptions
-            value: root.scanColor === "bw" && root.scanFormat !== "pdf" ? "gray" : root.scanColor
-            hasCursor: root.hasCursor("scan:color")
-            onPicked: function(v) { root.saveSetting("scanColor", v) }
-          }
-
-          OptionRow {
-            label: "Quality (dpi)"
-            options: root.dpiOptions
-            value: root.scanDpi
-            hasCursor: root.hasCursor("scan:dpi")
-            onPicked: function(v) { root.saveSetting("scanDpi", v) }
-          }
-
-          OptionRow {
-            label: "Page size"
-            options: root.sizeOptions
-            value: root.scanSize
-            hasCursor: root.hasCursor("scan:size")
-            onPicked: function(v) { root.saveSetting("scanSize", v) }
-          }
-
-          OptionRow {
-            label: "Format"
-            options: root.formatOptions
-            value: root.scanFormat
-            hasCursor: root.hasCursor("scan:format")
-            onPicked: function(v) { root.saveSetting("scanFormat", v) }
-          }
-
-          Item {
-            width: parent.width
-            implicitHeight: Math.max(openLabel.implicitHeight, openSwitch.implicitHeight)
-
-            Text {
-              id: openLabel
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              textFormat: Text.PlainText
-              text: "Open the file after scanning"
-              color: root.dimForeground
-              font.family: root.ff
-              font.pixelSize: Style.font.bodySmall
-            }
-
-            ToggleSwitch {
-              id: openSwitch
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              checked: root.scanOpen
-              foreground: root.barForeground
-              hasCursor: root.hasCursor("scan:open")
-              onToggled: root.saveSetting("scanOpen", !root.scanOpen)
-            }
-          }
-
-          Button {
-            width: parent.width
-            enabled: root.scanning || !root.offline
-            iconText: root.scanning ? "\u{f0156}" : "\u{f06ab}" // close / scanner
-            iconSize: Style.font.icon
-            text: root.scanning ? "Cancel scan" : "Scan"
-            hasCursor: root.hasCursor("scan:go")
-            fontSize: Style.font.bodySmall
-            foreground: root.scanning ? root.urgent : root.barForeground
-            fontFamily: root.ff
-            bordered: true
-            horizontalPadding: Style.spacing.controlPaddingX
-            verticalPadding: Style.spacing.controlPaddingY + Style.space(4)
-            onClicked: root.scanning ? root.cancelScan() : root.startScan()
-          }
-
-          PanelSeparator { visible: root.lastScan.length > 0; foreground: root.barForeground }
-
-          // ---------- Last scan ----------
-          Column {
-            visible: root.lastScan.length > 0
-            width: parent.width
-            spacing: Style.space(6)
-
-            Item {
-              width: parent.width
-              implicitHeight: lastTitle.implicitHeight
-
-              PanelSectionHeader {
-                id: lastTitle
-                text: "LAST SCAN"
-                foreground: root.barForeground
-                fontFamily: root.ff
-              }
-
-              PanelSectionHeader {
-                anchors.right: parent.right
-                visible: root.lastScan.length > 1
-                text: root.lastScan.length + " FILES"
-                foreground: root.barForeground
-                fontFamily: root.ff
-              }
-            }
-
-            InfoRow {
-              icon: root.scanFormat === "jpeg" ? "\u{f021f}" : "\u{f0226}" // image / pdf
-              key: root.fileName(root.lastScan[0])
-              value: ""
-            }
-
-            Row {
+              visible: root.lastScan.length > 0
               width: parent.width
               spacing: Style.space(6)
 
-              Button {
-                width: (parent.width - parent.spacing) / 2
-                iconText: "\u{f0214}" // file
-                iconSize: Style.font.icon
-                text: "Open"
-                hasCursor: root.hasCursor("scan:file")
-                fontSize: Style.font.bodySmall
-                foreground: root.barForeground
-                fontFamily: root.ff
-                bordered: true
-                horizontalPadding: Style.spacing.controlPaddingX
-                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-                onClicked: root.openPath(root.lastScan[0])
+              Item {
+                width: parent.width
+                implicitHeight: lastTitle.implicitHeight
+
+                PanelSectionHeader {
+                  id: lastTitle
+                  text: "LAST SCAN"
+                  foreground: root.barForeground
+                  fontFamily: root.ff
+                }
+
+                PanelSectionHeader {
+                  anchors.right: parent.right
+                  visible: root.lastScan.length > 1
+                  text: root.lastScan.length + " FILES"
+                  foreground: root.barForeground
+                  fontFamily: root.ff
+                }
               }
 
-              Button {
-                width: (parent.width - parent.spacing) / 2
-                iconText: "\u{f024b}" // folder
-                iconSize: Style.font.icon
-                text: "Folder"
-                hasCursor: root.hasCursor("scan:folder")
-                fontSize: Style.font.bodySmall
-                foreground: root.barForeground
-                fontFamily: root.ff
-                bordered: true
-                horizontalPadding: Style.spacing.controlPaddingX
-                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-                onClicked: root.openPath(root.lastScanDir)
+              InfoRow {
+                icon: root.scanFormat === "jpeg" ? "\u{f021f}" : "\u{f0226}" // image / pdf
+                key: root.fileName(root.lastScan[0])
+                value: ""
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.space(6)
+
+                Button {
+                  width: (parent.width - parent.spacing) / 2
+                  iconText: "\u{f0214}" // file
+                  iconSize: Style.font.icon
+                  text: "Open"
+                  hasCursor: root.hasCursor("scan:file")
+                  fontSize: Style.font.bodySmall
+                  foreground: root.barForeground
+                  fontFamily: root.ff
+                  bordered: true
+                  horizontalPadding: Style.spacing.controlPaddingX
+                  verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                  onClicked: root.openPath(root.lastScan[0])
+                }
+
+                Button {
+                  width: (parent.width - parent.spacing) / 2
+                  iconText: "\u{f024b}" // folder
+                  iconSize: Style.font.icon
+                  text: "Folder"
+                  hasCursor: root.hasCursor("scan:folder")
+                  fontSize: Style.font.bodySmall
+                  foreground: root.barForeground
+                  fontFamily: root.ff
+                  bordered: true
+                  horizontalPadding: Style.spacing.controlPaddingX
+                  verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                  onClicked: root.openPath(root.lastScanDir)
+                }
               }
             }
           }
